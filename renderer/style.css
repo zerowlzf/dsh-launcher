@@ -95,7 +95,6 @@ webview {
   height: 100%;
   background: var(--bg-deep);
 }
-webview.hidden { display: none; }
 
 /* ---------- 启动覆盖层 ---------- */
 #launch {
