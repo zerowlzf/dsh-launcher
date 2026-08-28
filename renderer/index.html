@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; img-src 'self' data:; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" />
   <title>DeepSeek Harness</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -18,7 +18,7 @@
 
   <main>
     <!-- DSH Web GUI -->
-    <webview id="view" src="about:blank" partition="persist:dsh-launcher" allowpopups class="hidden"></webview>
+    <webview id="view" src="about:blank" partition="persist:dsh-launcher" allowpopups style="display:none"></webview>
 
     <!-- 启动 / 状态覆盖层 -->
     <div id="launch">

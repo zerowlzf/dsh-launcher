@@ -55,9 +55,9 @@ function applyStatus(s) {
     launch.className = s.state
   }
 
-  // 非就绪/断线时隐藏 webview，避免后台加载无关页面（hidden 类由 CSS 控制，避开 CSP style-src）
+  // 非就绪/断线时隐藏 webview，避免后台加载无关页面
   const showWebview = s.state === 'ready' || s.state === 'degraded'
-  view.classList.toggle('hidden', !showWebview)
+  view.style.display = showWebview ? '' : 'none'
 
   // 启动覆盖层内容
   const statusMsgs = {
@@ -107,17 +107,22 @@ function applyStatus(s) {
   if (s.state === 'ready') {
     if (recovered) {
       viewReady = false
-      // 仅当 webview 已在目标 URL 时才需要 reload（刷新断线/旧会话页面）；
-      // 若 URL 已变化（如 DSH 重启换了令牌），直接导航到新 URL 即可，
+      // 仅当 webview 已在使用目标 URL（lastSetUrl 与 currentUrl 一致，token 未变）时
+      // 才需要 reload（刷新断线/旧会话页面）；若 URL/令牌已变化，直接导航到新 URL，
       // 先 reload 旧 src 只会白加载一次（旧令牌 URL → 401）。
-      if (sameUrl(view.getAttribute('src'), currentUrl)) view.reload()
+      // 注意不能比较 getAttribute('src')：DSH 认证 303 重定向会把该属性改写为 /，
+      // 用它做比较会陷入"永远不匹配→反复设置 src→重定向→再比较"的闪烁循环。
+      if (lastSetUrl === currentUrl) view.reload()
     }
     ensureWebviewLoaded(6)
   }
 }
 
-// 设置 src 并轮询确认。webview 在页面加载早期可能尚未初始化，
-// 此时赋值会被静默吞掉（src 保持 about:blank），必须重试直到生效。
+// 最后实际设置给 webview 的 src。webview 的 getAttribute('src') 会被 DSH 认证
+// 303 重定向改写成 /（Cookie 已建立），因此不能用它判断"目标是否已生效"；
+// 只能跟踪自己最后一次设置的值。
+let lastSetUrl = ''
+
 // 比较时忽略尾部斜杠：浏览器会把 http://host:port 规范化为 http://host:port/
 function sameUrl(a, b) {
   return (a || '').replace(/\/+$/, '') === (b || '').replace(/\/+$/, '')
@@ -125,19 +130,20 @@ function sameUrl(a, b) {
 
 function ensureWebviewLoaded(retries) {
   const target = currentUrl
-  if (sameUrl(view.getAttribute('src'), target) && viewReady) {
+  if (lastSetUrl === target && viewReady) {
     clearTimeout(ensureTimer)
     return
   }
 
-  view.classList.remove('hidden')
+  view.style.display = ''
   viewReady = false
-  if (!sameUrl(view.getAttribute('src'), target)) {
+  if (lastSetUrl !== target) {
+    lastSetUrl = target
     view.src = target
   }
   clearTimeout(ensureTimer)
   ensureTimer = setTimeout(() => {
-    if (currentState === 'ready' && !sameUrl(view.getAttribute('src'), target) && retries > 0) {
+    if (currentState === 'ready' && lastSetUrl !== currentUrl && retries > 0) {
       console.log('webview src 未生效，重试剩余', retries)
       ensureWebviewLoaded(retries - 1)
     }
