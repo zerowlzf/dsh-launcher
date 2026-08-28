@@ -1,5 +1,14 @@
 // DSH 启动器 — 渲染层
 /* global launcher */
+// 防御：preload 加载失败（路径损坏/被杀毒拦截）时 window.launcher 不存在，
+// 后续所有 IPC 调用会抛 ReferenceError → 整个脚本中断 → 界面静默黑屏、无任何提示。
+// 在此显式给出文案并终止，把"最难排查的黑屏"变成一眼可读的错误页。
+if (!window.launcher) {
+  const el0 = (id) => document.getElementById(id)
+  if (el0('launch-status')) el0('launch-status').textContent = '启动器内部通信初始化失败（preload 未加载）。请关闭启动器后重新打开；若反复出现，请检查安装目录是否完整。'
+  if (el0('spinner')) el0('spinner').style.display = 'none'
+  throw new Error('launcher preload missing: renderer aborted')
+}
 const el = (id) => document.getElementById(id)
 const view = el('view')
 const launch = el('launch')
@@ -123,11 +132,6 @@ function applyStatus(s) {
 // 只能跟踪自己最后一次设置的值。
 let lastSetUrl = ''
 
-// 比较时忽略尾部斜杠：浏览器会把 http://host:port 规范化为 http://host:port/
-function sameUrl(a, b) {
-  return (a || '').replace(/\/+$/, '') === (b || '').replace(/\/+$/, '')
-}
-
 function ensureWebviewLoaded(retries) {
   const target = currentUrl
   if (lastSetUrl === target && viewReady) {
@@ -159,7 +163,10 @@ view.addEventListener('dom-ready', () => {
 // （app.on('web-contents-created')，见 main.js）；此处不再逐实例接线
 // （<webview>.getWebContents() 已废弃）。
 
-view.addEventListener('did-finish-load', () => {
+view.addEventListener('did-finish-load', (e) => {
+  // 子框架（iframe 等）完成加载不代表主页面就绪，误置 viewReady 会让
+  // ensureWebviewLoaded 提前短路、跳过本该有的重试
+  if (!e.isMainFrame) return
   viewReady = true
   if (currentState === 'ready') banner.hidden = true
 })
@@ -208,7 +215,8 @@ bannerRetry.addEventListener('click', () => {
     view.reload()
   }
   launcher.retry().finally(() => {
+    // 只恢复可用态，不在此重写文案：retry 引发的状态推送会经 applyStatus
+    // 重设横幅文字；这里再写会用错文案覆盖（如 failed 态应显示“重试”）
     bannerRetry.disabled = false
-    bannerRetry.textContent = currentState === 'stopped' ? '重新启动' : '立即重连'
   })
 })
