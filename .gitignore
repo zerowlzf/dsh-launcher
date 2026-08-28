@@ -1,0 +1,11 @@
+# 依赖
+node_modules/
+
+# 运行时产物（启动器日志实际写在 userData，此处兜底）
+*.log
+
+# 系统/编辑器杂项
+Thumbs.db
+Desktop.ini
+.DS_Store
+npm-debug.log*

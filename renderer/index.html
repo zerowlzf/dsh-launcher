@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'" />
+  <title>DeepSeek Harness</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header id="titlebar">
+    <img id="logo" src="../assets/whale-white.svg" alt="" draggable="false" />
+    <span id="title">DeepSeek Harness</span>
+    <span id="status-pill" class="idle">
+      <span id="dot"></span><span id="pill-text">连接中…</span>
+    </span>
+    <span id="titlebar-spacer"></span>
+  </header>
+
+  <main>
+    <!-- DSH Web GUI -->
+    <webview id="view" src="about:blank" partition="persist:dsh-launcher" allowpopups style="display:none"></webview>
+
+    <!-- 启动 / 状态覆盖层 -->
+    <div id="launch">
+      <div class="launch-inner">
+        <img id="launch-logo" src="../assets/whale-white.svg" alt="" draggable="false" />
+        <h1 id="launch-title">DeepSeek Harness</h1>
+        <p id="launch-status">正在探测服务…</p>
+        <div id="spinner"></div>
+        <div id="log-wrap">
+          <pre id="log"></pre>
+        </div>
+        <div id="actions" hidden>
+          <button id="btn-retry" class="primary">启动 DSH</button>
+          <button id="btn-stop">停止 DSH</button>
+          <button id="btn-browser">在浏览器中打开</button>
+          <button id="btn-copy-log">复制日志</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 断线横幅 -->
+    <div id="banner" hidden>
+      <span id="banner-text">连接断开，正在等待 DSH 恢复…</span>
+      <button id="banner-retry">立即重连</button>
+    </div>
+  </main>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
