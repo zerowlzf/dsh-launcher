@@ -102,6 +102,7 @@ let stopPromise = null
 let quitting = false
 let probeTimer = null
 let slowBootNotified = false
+let tokenWaitNotified = false  // 令牌迟迟未捕获提示只弹一次
 let probing = false       // 探测在飞标志：防止慢探测周期重叠堆积
 let authHintShown = false // 401 无令牌提示只弹一次
 let logDirReady = false   // 日志目录惰性创建缓存
@@ -281,6 +282,7 @@ function startDsh() {
   childStartAt = Date.now()
   slowBootNotified = false
   authHintShown = false
+  tokenWaitNotified = false
   // 新进程会打印新的 ?token=，旧令牌立即作废；就绪判定改为等待令牌捕获后的认证 URL
   state.token = null
   state.url = baseUrl()
@@ -348,6 +350,10 @@ function startDsh() {
       if (!isCurrent) return    // 旧进程退出事件迟到：仅留日志，不动全局状态
       child = null
       childStartAt = 0
+      // 进程已退出，其启动令牌必然失效：清空并还原基础 URL，
+      // 避免残留端口时用旧令牌探测误判为"需要令牌"
+      state.token = null
+      state.url = baseUrl()
       // 只匹配本次运行自身的输出（含 stderr），不受全局日志轮转影响
       const runLog = runLines.join('\n')
       const noOpenError = /unknown (option|argument)|invalid option/i.test(runLog) && runLog.includes('no-open')
@@ -417,9 +423,10 @@ function stopDsh() {
         child = null
       }
       childStartAt = 0
-      // 进程已终止，旧令牌失效；还原为无令牌基础 URL，新启动时重新捕获
+      // 进程已终止，旧令牌失效：还原为无令牌基础 URL，并从持久化配置中删除
       state.token = null
       state.url = baseUrl()
+      saveSettings({ token: null })
       setState({ value: 'stopped', pid: null })
     } finally {
       stopping = false
@@ -478,6 +485,13 @@ function ensureRunning() {
         authHintShown = true
         appendLog('检测到 DSH 需要启动令牌（401）。若是外部启动的 DSH，请复制其打印的带 ?token= 的 URL 在浏览器打开，或通过托盘菜单“重新启动 DSH”让本启动器接管。')
         notify('DSH 需要认证', '请通过“重新启动 DSH”接管，或使用外部 DSH 打印的令牌 URL。')
+      }
+      // 自己拉起的子进程：令牌行迟迟未捕获时给出超时提示，避免永远“启动中”
+      if (child && state.value === 'starting' && childStartAt > 0 && Date.now() - childStartAt > START_BUDGET_MS) {
+        if (!tokenWaitNotified) {
+          tokenWaitNotified = true
+          appendLog(`DSH 已响应但启动令牌迟迟未捕获（已超过 ${Math.round(START_BUDGET_MS / 1000)} 秒）。请检查上方日志，或通过托盘菜单“重新启动 DSH”重置。`)
+        }
       }
       return
     }
@@ -657,13 +671,14 @@ ipcMain.handle('launcher:retry', async () => {
     return
   }
   if (status === 'auth') {
-    // 服务在但 401：自己拉起的子进程等令牌行；外部 DSH 则提示用户接管
+    // 服务在但 401：自己拉起的子进程等令牌行；外部 DSH 则提示用户接管。
+    // 无子进程时保持当前状态（failed/stopped 的操作按钮仍可用），仅落日志提示；
+    // 不切 degraded —— degraded 会显示 webview（无令牌 URL → 401 页）而非日志提示。
     if (child) {
       appendLog('DSH 已响应但尚未捕获启动令牌，继续等待…')
       setState({ value: 'starting' })
     } else {
       appendLog('DSH 需要启动令牌（401）。请复制其打印的带 ?token= 的 URL 在浏览器打开，或先“停止 DSH”再由本启动器启动。')
-      setState({ value: 'degraded' })
     }
     return
   }
