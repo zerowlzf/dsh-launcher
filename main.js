@@ -224,16 +224,17 @@ function notify(title, body) {
 }
 
 // ---------------------------------------------------------------- DSH control
-// 探测服务状态：'up'（可访问，2xx/3xx）、'auth'（服务在但需令牌，401/4xx）、'down'
+// 探测服务状态：'up'（可访问，2xx/3xx）、'auth'（服务在但需令牌，仅 401）、'down'
 function isUp() {
   return new Promise((resolve) => {
     const req = http.get(state.url, { timeout: 5000 }, (res) => {
       res.resume()
       const code = res.statusCode
       // 3xx 视为就绪：带令牌访问会 303 跳转到 /，无令牌访问 401。
-      // 5xx 视为未就绪：端口被无关服务占用但不健康时不误判为可用。
+      // 仅 401 视为"需要令牌"；404/403 等其它 4xx 归 down（端口被无关服务占用但不健康）。
+      // 5xx 同样视为未就绪。
       if (code >= 200 && code < 400) return resolve('up')
-      if (code >= 400 && code < 500) return resolve('auth')
+      if (code === 401) return resolve('auth')
       resolve('down')
     })
     req.on('timeout', () => {
@@ -277,7 +278,9 @@ function waitPortFree(timeoutMs = PORT_FREE_TIMEOUT_MS) {
 }
 
 function startDsh() {
-  if (child || stopping) return
+  // 返回 null=已启动；返回字符串=被守卫拒绝的原因（调用方负责回滚状态）
+  if (child) return '已有 DSH 子进程在运行'
+  if (stopping) return '停止进行中，请稍候再试'
   appendLog(`启动 DSH: ${cfg.startCmd.join(' ')}  (cwd: ${cfg.dshDir})`)
   childStartAt = Date.now()
   slowBootNotified = false
@@ -292,12 +295,23 @@ function startDsh() {
   // 会混入上一轮历史（其中可能残留旧的 unknown-option 文本，导致误判误兜底）。
   const runLines = []
   let portDriftWarned = false
+  // stdout/stderr 按 chunk 到达，行可能被 TCP/管道缓冲截断成两段。
+  // 每个流独立维护尾部缓冲拼接残缺行，避免 `dsh web: ...?token=` 跨 chunk 丢失令牌。
+  const makeLinePusher = (prefix) => {
+    let tail = ''
+    return (raw) => {
+      const line = (tail + raw).replace(/\r$/u, '')
+      const pieces = line.split('\n')
+      tail = pieces.pop() ?? ''
+      pieces.filter(Boolean).forEach((l) => logRun(prefix + l))
+    }
+  }
+  const pushStdout = makeLinePusher('')
+  const pushStderr = makeLinePusher('ERR ')
   const logRun = (line) => {
     runLines.push(line)
     if (runLines.length > RUNLOG_MAX_LINES) runLines.shift()
-    appendLog(line)
-    // 启动令牌捕获：DSH 就绪时打印 `dsh web: http://127.0.0.1:PORT/?token=...`。
-    // 捕获后切换到认证 URL，探测与 webview 才真正可用（新版 DSH web 无令牌返回 401）。
+    // 令牌捕获必须在脱敏前：从原始行提取令牌
     const urlMatch = line.match(/dsh web:\s*(https?:\/\/\S+)/i)
     if (urlMatch) {
       try {
@@ -312,6 +326,8 @@ function startDsh() {
         }
       } catch { /* 非 URL 行，忽略 */ }
     }
+    // 落日志前对令牌脱敏：bearer 凭证不得进入 dsh.log/state.log/渲染层/剪贴板
+    appendLog(line.replace(/([?&]token=)[^&\s]+/gi, '$1***'))
     // 端口漂移检测：DSH 自报的监听地址与配置探测端口不一致时提醒一次
     //（先落证据行再落警告，日志时间顺序才读得通）
     if (!portDriftWarned) {
@@ -334,8 +350,8 @@ function startDsh() {
     })
     child = c
     c.unref()
-    c.stdout.on('data', (d) => String(d).split(/\r?\n/).filter(Boolean).forEach(logRun))
-    c.stderr.on('data', (d) => String(d).split(/\r?\n/).filter(Boolean).forEach((l) => logRun(`ERR ${l}`)))
+    c.stdout.on('data', (d) => pushStdout(String(d)))
+    c.stderr.on('data', (d) => pushStderr(String(d)))
     c.on('error', (e) => {
       appendLog(`启动失败: ${e.message}`)
       if (child !== c) return   // 迟到事件：新进程已接管，忽略
@@ -350,6 +366,9 @@ function startDsh() {
       if (!isCurrent) return    // 旧进程退出事件迟到：仅留日志，不动全局状态
       child = null
       childStartAt = 0
+      // 进程已退出：停止监听输出流，防止缓冲中的迟到 data 事件重新捕获已失效的令牌
+      c.stdout.removeAllListeners('data')
+      c.stderr.removeAllListeners('data')
       // 进程已退出，其启动令牌必然失效：清空并还原基础 URL，
       // 避免残留端口时用旧令牌探测误判为"需要令牌"
       state.token = null
@@ -455,6 +474,9 @@ function ensureRunning() {
   isUp().then(async (status) => {
     if (stopping) return   // 停止过程中不推进状态机，避免竞态误报
     if (status === 'up') {
+      // stopped/failed 是用户主动停止或启动失败的明确状态：端口被残留进程占用
+      // 返回 2xx 时不得自动翻转为 ready（与用户停止意图矛盾），交给用户点"重试"。
+      if (state.value === 'stopped' || state.value === 'failed') return
       if (state.value !== 'ready' && state.value !== 'degraded') {
         const pid = child?.pid || await findPidOnPort()
         setState({ value: 'ready', pid })
@@ -683,8 +705,14 @@ ipcMain.handle('launcher:retry', async () => {
     return
   }
   if (!child) {
-    setState({ value: 'starting' })
-    startDsh()
+    const reason = startDsh()
+    if (reason) {
+      // 守卫拒绝（停止进行中等极窄窗口）：回滚 starting，避免卡死等待
+      appendLog(`启动 DSH 被拒绝: ${reason}`)
+      setState({ value: state.value === 'starting' ? 'failed' : state.value })
+    } else {
+      setState({ value: 'starting' })
+    }
     return
   }
   // 子进程仍在但服务未就绪：DSH 冷启动可能长达 2 分钟以上，
@@ -694,8 +722,13 @@ ipcMain.handle('launcher:retry', async () => {
     appendLog(`重试：DSH ${Math.round(elapsedMs / 1000)} 秒未就绪，终止后重新拉起`)
     await stopDsh()
     await waitPortFree()
-    setState({ value: 'starting' })
-    startDsh()
+    const reason = startDsh()
+    if (reason) {
+      appendLog(`重启 DSH 被拒绝: ${reason}`)
+      setState({ value: 'failed' })
+    } else {
+      setState({ value: 'starting' })
+    }
   } else {
     appendLog(`DSH 仍在启动中（已 ${Math.round(elapsedMs / 1000)} 秒），继续等待…`)
     setState({ value: 'starting' })
@@ -722,6 +755,14 @@ app.on('web-contents-created', (_event, wc) => {
       if (/^https?:\/\//i.test(url)) shell.openExternal(url)
       return { action: 'deny' }
     })
+    // 导航拦截：仅放行 loopback 地址，防止不可信远程内容进入内嵌 webview
+    // （DSH GUI 内的外部链接应被拦截并交给系统浏览器打开）。
+    wc.on('will-navigate', (e, url) => {
+      if (!/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(url)) {
+        e.preventDefault()
+        if (/^https?:\/\//i.test(url)) shell.openExternal(url)
+      }
+    })
   }
 })
 
@@ -736,6 +777,15 @@ if (!app.requestSingleInstanceLock()) {
   app.on('second-instance', showWindow)
   app.whenReady().then(() => {
     ensureLogBom()
+    // webview 会话权限默认拒绝：DSH Web GUI 不需要通知/摄像头/地理位置等敏感权限，
+    // 防止被导航进入的不可信页面申请权限。允许无害的剪贴板写入（复制按钮）。
+    const { session } = require('electron')
+    const webviewSession = session.fromPartition('persist:dsh-launcher')
+    const allowedPermissions = new Set(['clipboard-sanitized-write'])
+    webviewSession.setPermissionRequestHandler((_wc, permission, callback) => {
+      callback(allowedPermissions.has(permission))
+    })
+    webviewSession.setPermissionCheckHandler((_wc, permission) => allowedPermissions.has(permission))
     createWindow()
     createTray()
     setState({ value: 'idle', log: [] })

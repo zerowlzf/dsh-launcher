@@ -125,7 +125,10 @@ function sameUrl(a, b) {
 
 function ensureWebviewLoaded(retries) {
   const target = currentUrl
-  if (sameUrl(view.getAttribute('src'), target) && viewReady) return
+  if (sameUrl(view.getAttribute('src'), target) && viewReady) {
+    clearTimeout(ensureTimer)
+    return
+  }
 
   view.style.display = ''
   viewReady = false
@@ -191,6 +194,13 @@ el('btn-copy-log').addEventListener('click', () => {
 bannerRetry.addEventListener('click', () => {
   bannerRetry.disabled = true
   bannerRetry.textContent = '正在处理…'
+  // ready 状态下 retry() 不会翻转状态（prevState 仍为 ready → recovered=false），
+  // 而 ensureWebviewLoaded 因 src 已匹配不会重设 → 加载失败后重试会卡死。
+  // 因此 ready 时显式 reload webview。
+  if (currentState === 'ready') {
+    viewReady = false
+    view.reload()
+  }
   launcher.retry().finally(() => {
     bannerRetry.disabled = false
     bannerRetry.textContent = currentState === 'stopped' ? '重新启动' : '立即重连'
