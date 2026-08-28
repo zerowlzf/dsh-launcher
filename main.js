@@ -302,8 +302,9 @@ function startDsh() {
   const makeLinePusher = (prefix) => {
     let tail = ''
     return (raw) => {
-      const line = (tail + raw).replace(/\r$/u, '')
-      const pieces = line.split('\n')
+      // 按 \r?\n 切分（兼容 CRLF/LF），并保留尾部残缺段供下一 chunk 拼接。
+      // 不能只 replace 末尾一个 \r：多行 chunk 的中间行也会残留 \r。
+      const pieces = (tail + raw).split(/\r?\n/)
       tail = pieces.pop() ?? ''
       pieces.filter(Boolean).forEach((l) => logRun(prefix + l))
     }
