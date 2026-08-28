@@ -1,0 +1,14 @@
+{
+  "name": "dsh-launcher",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 桌面启动器 — Win11 风格炭黑窗口 + 托盘驻留 + 自动启动/检测 DSH",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node test-race.js"
+  },
+  "devDependencies": {
+    "electron": "^43.4.1"
+  }
+}

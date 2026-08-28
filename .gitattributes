@@ -1,0 +1,2 @@
+# 仓库统一 LF，避免 Windows 编辑器写 CRLF 造成 diff 噪音
+* text=auto eol=lf
