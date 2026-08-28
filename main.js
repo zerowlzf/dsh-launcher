@@ -21,7 +21,7 @@ const DEFAULTS = {
 
 // 集中管理的关键阈值
 const PROBE_INTERVAL_MS = 2000        // 服务探测周期
-const START_BUDGET_MS = 200 * 1000    // 启动预算：超过则视为卡死，可强杀重启
+const START_BUDGET_MS = 200 * 1000    // 启动预算：探测循环超时仅提醒（进程活着可能只是启动慢）；手动重试超时才强杀重启
 const PORT_FREE_TIMEOUT_MS = 8000     // 停止后等待端口释放的兜底窗口
 const LOG_MAX_BYTES = 2 * 1024 * 1024 // dsh.log 轮转阈值
 const LOG_KEEP_LINES = 2000           // 轮转保留行数
@@ -301,36 +301,70 @@ function startDsh() {
   // 每个流独立维护尾部缓冲拼接残缺行，避免 `dsh web: ...?token=` 跨 chunk 丢失令牌。
   const makeLinePusher = (prefix) => {
     let tail = ''
-    return (raw) => {
+    const push = (raw) => {
       // 按 \r?\n 切分（兼容 CRLF/LF），并保留尾部残缺段供下一 chunk 拼接。
       // 不能只 replace 末尾一个 \r：多行 chunk 的中间行也会残留 \r。
       const pieces = (tail + raw).split(/\r?\n/)
       tail = pieces.pop() ?? ''
       pieces.filter(Boolean).forEach((l) => logRun(prefix + l))
     }
+    // 进程退出时冲刷尾部残缺行：最后一行往往没有换行符，且常常正是退出原因，
+    // 不 flush 会随解绑监听一起丢失。
+    push.flush = () => {
+      if (tail) {
+        const last = tail
+        tail = ''
+        logRun(prefix + last)
+      }
+    }
+    return push
   }
   const pushStdout = makeLinePusher('')
   const pushStderr = makeLinePusher('ERR ')
   const logRun = (line) => {
-    runLines.push(line)
-    if (runLines.length > RUNLOG_MAX_LINES) runLines.shift()
-    // 令牌捕获必须在脱敏前：从原始行提取令牌
-    const urlMatch = line.match(/dsh web:\s*(https?:\/\/\S+)/i)
-    if (urlMatch) {
+    // 令牌捕获必须在脱敏前：从原始行提取令牌。
+    // 主匹配 `dsh web:` 前缀（官方输出格式）；兜底匹配任意 loopback URL 携带
+    // ?token= 查询参数的行，避免 DSH 输出格式微调（如改叫 "Web UI:"）导致
+    // 令牌永远捕获不到、启动器卡在 401 循环提示。
+    let rawUrl = null
+    const m1 = line.match(/dsh web:\s*(https?:\/\/\S+)/i)
+    if (m1) {
+      rawUrl = m1[1]
+    } else {
+      const m2 = line.match(/https?:\/\/(?:127\.0\.0\.1|\[::1\]|localhost):\d+\/\?[^\s]*\btoken=[^\s&]+/i)
+      if (m2) rawUrl = m2[0]
+    }
+    if (rawUrl) {
       try {
-        const token = new URL(urlMatch[1]).searchParams.get('token')
+        const u = new URL(rawUrl)
+        const token = u.searchParams.get('token')
         if (token && token !== state.token) {
+          // 统一重建认证 URL：与恢复路径（encodeURIComponent）同构。若直接沿用
+          // DSH 原始串，令牌含 +/= 等字符时两条路径的字面量不同，渲染层
+          // lastSetUrl 严格比较会多触发一次无谓导航。
           state.token = token
-          // 直接用 DSH 自报的完整 URL（含真实端口与令牌），避免端口漂移时探测错端口
-          state.url = urlMatch[1]
+          state.url = `${u.origin}${u.pathname}?token=${encodeURIComponent(token)}`
+          // 同步真实端口（端口漂移时 baseUrl/findPidOnPort 才能对准进程）
+          const realPort = Number(u.port)
+          if (realPort && realPort !== state.port) {
+            state.port = realPort
+            portDriftWarned = true
+            appendLog(`DSH 实际监听端口 ${realPort}，与配置 ${cfg.port} 不一致，已自动跟随。建议把 settings.json 的 port 改为 ${realPort} 后重启启动器。`)
+            notify('DSH 端口漂移', `DSH 监听 ${realPort}，已自动跟随。建议更新 settings.json 的 port。`)
+          }
           // 持久化令牌：重启启动器（DSH 仍由上次启动器拉起）时可直接复用认证
           saveSettings({ token })
           appendLog(`已捕获 DSH 启动令牌，切换到认证 URL`)
+          if (tray) tray.setToolTip(`DSH 启动器 · ${baseUrl()}`)
         }
       } catch { /* 非 URL 行，忽略 */ }
     }
     // 落日志前对令牌脱敏：bearer 凭证不得进入 dsh.log/state.log/渲染层/剪贴板
-    appendLog(line.replace(/([?&]token=)[^&\s]+/gi, '$1***'))
+    const safeLine = line.replace(/([?&]token=)[^&\s]+/gi, '$1***')
+    appendLog(safeLine)
+    // 运行缓冲只留脱敏行：no-open 兜底检测只看选项报错文本，无需令牌明文
+    runLines.push(safeLine)
+    if (runLines.length > RUNLOG_MAX_LINES) runLines.shift()
     // 端口漂移检测：DSH 自报的监听地址与配置探测端口不一致时提醒一次
     // 启用自动跟随：state.port 同步为实际端口（findPidOnPort 等函数用 state.port 查 PID）
     if (!portDriftWarned) {
@@ -340,6 +374,7 @@ function startDsh() {
         state.port = Number(m[1])
         appendLog(`DSH 实际监听端口 ${m[1]}，与配置 ${cfg.port} 不一致，已自动跟随。建议把 settings.json 的 port 改为 ${m[1]} 后重启启动器，以避免下次启动时端口漂移重复出现。`)
         notify('DSH 端口漂移', `DSH 监听 ${m[1]}，已自动跟随。建议更新 settings.json 的 port。`)
+        if (tray) tray.setToolTip(`DSH 启动器 · ${baseUrl()}`)
       }
     }
   }
@@ -367,20 +402,35 @@ function startDsh() {
       appendLog(`DSH 进程退出 (code=${code} sig=${sig})`)
       const isCurrent = child === c
       const elapsed = Date.now() - childStartAt
+      const startedAt = childStartAt   // 置 0 前保存本次启动时刻，EADDRINUSE 等待路径要恢复它
       if (!isCurrent) return    // 旧进程退出事件迟到：仅留日志，不动全局状态
       child = null
       childStartAt = 0
-      // 进程已退出：停止监听输出流，防止缓冲中的迟到 data 事件重新捕获已失效的令牌
+      // 先冲刷输出缓冲的尾部残缺行（退出前的最后输出往往是失败原因），
+      // 再解除流监听，防止缓冲中迟到的 data 事件在退出后重新捕获已失效的令牌。
+      pushStdout.flush()
+      pushStderr.flush()
       c.stdout.removeAllListeners('data')
       c.stderr.removeAllListeners('data')
-      // 进程已退出，其启动令牌必然失效：清空并还原基础 URL，
-      // 避免残留端口时用旧令牌探测误判为"需要令牌"
+      // 进程已退出，其启动令牌必然失效：清空内存与持久化副本并还原基础 URL，
+      // 避免下次启动启动器时拿失效令牌去探测（401 白绕一圈）。
+      // 崩溃退出不走 stopDsh，所以持久化清理只能在这里兜底。
       state.token = null
       state.url = baseUrl()
+      saveSettings({ token: null })
       // 只匹配本次运行自身的输出（含 stderr），不受全局日志轮转影响
       const runLog = runLines.join('\n')
       const noOpenError = /unknown (option|argument)|invalid option/i.test(runLog) && runLog.includes('no-open')
       const failedFast = code !== 0 && state.value === 'starting' && elapsed < 10000
+      // 端口被占导致快速退出（EADDRINUSE）：占用者极可能是正在冷启动的另一个
+      // DSH 实例（如用户先手动启动 DSH、再打开启动器，启动器误拉了第二实例）。
+      // 不置 failed —— failed 有防误翻转保护，外部实例就绪后 UI 会卡在"启动失败"；
+      // 保持 starting 并恢复启动时间戳，探测循环在端口就绪后自动翻转 ready。
+      if (!stopping && state.value === 'starting' && /EADDRINUSE|address already in use/i.test(runLog)) {
+        childStartAt = startedAt
+        appendLog('DSH 启动时端口已被占用（可能另一个 DSH 实例正在启动），保持探测等待；若长期未就绪请查看日志或用托盘“停止 DSH”处理。')
+        return
+      }
       if (!stopping && failedFast && !noOpenFallbackUsed && cfg.startCmd.includes('--no-open') && noOpenError) {
         noOpenFallbackUsed = true
         appendLog('--no-open 可能不受当前 DSH 支持，尝试去掉后重新启动')
@@ -693,18 +743,39 @@ ipcMain.handle('launcher:retry', async () => {
   const status = await isUp()
   if (status === 'up') {
     const p = child?.pid || await findPidOnPort()
+    // 与 stopDsh 对齐的进程身份校验：端口被无关服务占用时不得宣告就绪，
+    // 否则 webview 会把陌生页面当作 DSH GUI 展示（stopped/failed 态重试同样适用）
+    if (!child && p && !(await looksLikeDsh(p))) {
+      appendLog(`端口 ${state.port} 由非 DSH 进程 (PID ${p}) 占用，已跳过就绪切换；如需停止它请用托盘“停止 DSH”。`)
+      return
+    }
     setState({ value: 'ready', pid: p })
     return
   }
   if (status === 'auth') {
-    // 服务在但 401：自己拉起的子进程等令牌行；外部 DSH 则提示用户接管。
-    // 无子进程时保持当前状态（failed/stopped 的操作按钮仍可用），仅落日志提示；
-    // 不切 degraded —— degraded 会显示 webview（无令牌 URL → 401 页）而非日志提示。
+    // 服务在但 401：自己拉起的子进程等令牌行；外部 DSH 则接管。
     if (child) {
       appendLog('DSH 已响应但尚未捕获启动令牌，继续等待…')
       setState({ value: 'starting' })
+      return
+    }
+    // 无子进程：用户点了“重试/启动 DSH”即明确授权接管外部 DSH。
+    // 只提示不动作会让窗口内无任何可用操作（idle 态不显示操作按钮），
+    // 因此先确认端口上确实是 DSH，再停止并由本启动器重新拉起。
+    const p = await findPidOnPort()
+    if (p && !(await looksLikeDsh(p))) {
+      appendLog(`端口 ${state.port} 由非 DSH 进程 (PID ${p}) 占用，无法接管；请先处理该端口占用。`)
+      return
+    }
+    appendLog('接管外部 DSH：停止后由本启动器重新启动…')
+    await stopDsh()
+    await waitPortFree()
+    const reason = startDsh()
+    if (reason) {
+      appendLog(`启动 DSH 被拒绝: ${reason}`)
+      setState({ value: 'failed' })
     } else {
-      appendLog('DSH 需要启动令牌（401）。请复制其打印的带 ?token= 的 URL 在浏览器打开，或先“停止 DSH”再由本启动器启动。')
+      setState({ value: 'starting' })
     }
     return
   }

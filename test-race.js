@@ -74,7 +74,7 @@ Module._load = function (request, parent, isMain) {
 
 // 加载 main.js 并把内部函数暴露出来供测试驱动
 const src = fs.readFileSync(mainPath, 'utf8')
-const wrapped = src + '\nmodule.exports.__test = { startDsh, stopDsh, restartDsh, getChild: () => child, getState: () => state, setState }'
+const wrapped = src + '\nmodule.exports.__test = { startDsh, stopDsh, restartDsh, getChild: () => child, getState: () => state, setState, getChildStartAt: () => childStartAt }'
 const m = new Module(mainPath, module)
 m.filename = mainPath
 m.paths = Module._nodeModulePaths(path.dirname(mainPath))
@@ -122,6 +122,36 @@ const T = m.exports.__test
   console.log('#3 spawned pid =', c3 && c3.pid, '| state =', g.value)
   if (!c3 || c3.pid !== 5002) throw new Error('FAIL: restartDsh 未重新拉起')
   console.log('PASS: restartDsh 停止→等端口释放→拉起 正常')
+
+  // --- 场景 4：EADDRINUSE 快速退出不误置 failed（端口被另一实例占用时保持等待） ---
+  // 场景：用户先手动启动 DSH（冷启动未监听）→ 启动器探测 down 误拉第二实例 →
+  // 外部实例先绑端口 → 第二实例 EADDRINUSE 退出。旧代码误置 failed，
+  // 外部实例就绪后 failed 防翻转保护会让 UI 卡死；新代码保持 starting + 恢复
+  // 启动时间戳，探测循环就绪后自动翻转 ready。
+  c3.emit('exit', 0, null)   // 先让场景 3 的进程退出，释放 child
+  g.value = 'starting'
+  T.startDsh()                       // #4
+  const c4 = T.getChild()
+  if (!c4 || c4.pid !== 5003) throw new Error('FAIL: #4 未启动')
+  const startedAt4 = T.getChildStartAt()
+  await new Promise((r) => setTimeout(r, 30))   // 让启动时间戳与退出时刻拉开
+  c4.stdout.emit('data', 'Error: listen EADDRINUSE: address already in use 127.0.0.1:3080\n')
+  c4.emit('exit', 1, null)
+  if (T.getChild() !== null) throw new Error('FAIL: EADDRINUSE 退出后 child 应为 null')
+  if (g.value !== 'starting') throw new Error(`FAIL: EADDRINUSE 应保持 starting 等待，实际 ${g.value}`)
+  const restoredAt = T.getChildStartAt()
+  if (restoredAt !== startedAt4) throw new Error(`FAIL: EADDRINUSE 应恢复启动时间戳 (got ${restoredAt}, want ${startedAt4})`)
+  console.log('PASS: EADDRINUSE 快速退出保持 starting 并恢复启动时间戳')
+
+  // --- 场景 5：普通快速失败（非 EADDRINUSE）仍正确置 failed ---
+  g.value = 'starting'
+  T.startDsh()                       // #5
+  const c5 = T.getChild()
+  if (!c5 || c5.pid !== 5004) throw new Error('FAIL: #5 未启动')
+  c5.stdout.emit('data', 'SyntaxError: Unexpected token in config\n')
+  c5.emit('exit', 1, null)
+  if (g.value !== 'failed') throw new Error(`FAIL: 普通快速失败应为 failed，实际 ${g.value}`)
+  console.log('PASS: 非端口占用的快速失败仍正确置 failed')
 
   console.log('\n全部通过 ✓')
   process.exit(0)
