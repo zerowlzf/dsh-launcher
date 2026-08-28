@@ -251,8 +251,10 @@ function findPidOnPort() {
   return new Promise((resolve) => {
     execFile('netstat', ['-ano', '-p', 'tcp'], { windowsHide: true }, (err, stdout) => {
       if (err) return resolve(null)
+      // netstat 状态列是本地化的（中文系统为"监听"），需同时匹配中英文，
+      // 否则非英文 Windows 上外部 DSH 停止功能会静默失效。
       for (const line of stdout.split(/\r?\n/)) {
-        const m = line.trim().match(/^TCP\s+(\[[^\]]*\]|[^:]+):(\d+)\s+\S+\s+LISTENING\s+(\d+)$/)
+        const m = line.trim().match(/^TCP\s+(\[[^\]]*\]|[^:]+):(\d+)\s+\S+\s+(?:LISTENING|监听)\s+(\d+)$/)
         if (m && Number(m[2]) === state.port) return resolve(Number(m[3]))
       }
       resolve(null)
@@ -329,13 +331,14 @@ function startDsh() {
     // 落日志前对令牌脱敏：bearer 凭证不得进入 dsh.log/state.log/渲染层/剪贴板
     appendLog(line.replace(/([?&]token=)[^&\s]+/gi, '$1***'))
     // 端口漂移检测：DSH 自报的监听地址与配置探测端口不一致时提醒一次
-    //（先落证据行再落警告，日志时间顺序才读得通）
+    // 启用自动跟随：state.port 同步为实际端口（findPidOnPort 等函数用 state.port 查 PID）
     if (!portDriftWarned) {
       const m = line.match(/https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)/i)
       if (m && Number(m[1]) !== cfg.port) {
         portDriftWarned = true
-        appendLog(`警告：DSH 实际监听端口 ${m[1]}，与启动器探测端口 ${cfg.port} 不一致，状态页将一直显示“启动中”。请把 settings.json 的 port 改为 ${m[1]} 后重启启动器`)
-        notify('DSH 端口不一致', `DSH 监听 ${m[1]}，启动器探测 ${cfg.port}，请更新 settings.json 的 port`)
+        state.port = Number(m[1])
+        appendLog(`DSH 实际监听端口 ${m[1]}，与配置 ${cfg.port} 不一致，已自动跟随。建议把 settings.json 的 port 改为 ${m[1]} 后重启启动器，以避免下次启动时端口漂移重复出现。`)
+        notify('DSH 端口漂移', `DSH 监听 ${m[1]}，已自动跟随。建议更新 settings.json 的 port。`)
       }
     }
   }
