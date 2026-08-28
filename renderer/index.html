@@ -2,6 +2,11 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
+  <!-- CSP 注意：style-src 的 'unsafe-inline' 是刻意保留的（2026-08 事故回退产物）：
+       去掉它会拒绝所有内联 style —— webview 的显示控制（初始 style="display:none"
+       属性 + renderer.js 的 style.display 切换）随即失效，webview 意外可见、
+       显示全面失控。Electron 实测确认：file:// 下 'self' 能正常加载本目录的
+       style.css / renderer.js，被拦的只有内联样式；script-src 'self' 才是不可放松的底线。 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" />
   <title>DeepSeek Harness</title>
   <link rel="stylesheet" href="style.css" />
