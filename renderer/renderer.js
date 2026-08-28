@@ -55,9 +55,9 @@ function applyStatus(s) {
     launch.className = s.state
   }
 
-  // 非就绪/断线时隐藏 webview，避免后台加载无关页面
+  // 非就绪/断线时隐藏 webview，避免后台加载无关页面（hidden 类由 CSS 控制，避开 CSP style-src）
   const showWebview = s.state === 'ready' || s.state === 'degraded'
-  view.style.display = showWebview ? '' : 'none'
+  view.classList.toggle('hidden', !showWebview)
 
   // 启动覆盖层内容
   const statusMsgs = {
@@ -130,7 +130,7 @@ function ensureWebviewLoaded(retries) {
     return
   }
 
-  view.style.display = ''
+  view.classList.remove('hidden')
   viewReady = false
   if (!sameUrl(view.getAttribute('src'), target)) {
     view.src = target
