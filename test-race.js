@@ -49,6 +49,10 @@ const stubs = {
     ipcMain: { handle() {} },
     screen: { getAllDisplays: () => [{ workArea: { x: 0, y: 0, width: 1920, height: 1040 } }] },
     clipboard: { writeText() {} },
+    session: { fromPartition: () => ({
+      setPermissionRequestHandler() {},
+      setPermissionCheckHandler() {},
+    }) },
   },
   child_process: {
     spawn: fakeSpawn,
