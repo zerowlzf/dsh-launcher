@@ -107,7 +107,10 @@ function applyStatus(s) {
   if (s.state === 'ready') {
     if (recovered) {
       viewReady = false
-      view.reload()
+      // 仅当 webview 已在目标 URL 时才需要 reload（刷新断线/旧会话页面）；
+      // 若 URL 已变化（如 DSH 重启换了令牌），直接导航到新 URL 即可，
+      // 先 reload 旧 src 只会白加载一次（旧令牌 URL → 401）。
+      if (sameUrl(view.getAttribute('src'), currentUrl)) view.reload()
     }
     ensureWebviewLoaded(6)
   }
