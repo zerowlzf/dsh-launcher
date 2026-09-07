@@ -1,7 +1,7 @@
 // DSH 桌面启动器 — main process
 // Win11 风格炭黑窗口 · 托盘驻留 · 自动探测/启动/停止 DSH（源码版）
 const { app, BrowserWindow, Tray, Menu, shell, nativeImage, ipcMain, screen } = require('electron')
-const { spawn, execFile } = require('child_process')
+const { spawn, execFile, spawnSync } = require('child_process')
 const fs = require('fs')
 const path = require('path')
 const http = require('http')
@@ -26,6 +26,7 @@ const PORT_FREE_TIMEOUT_MS = 8000     // 停止后等待端口释放的兜底窗
 const LOG_MAX_BYTES = 2 * 1024 * 1024 // dsh.log 轮转阈值
 const LOG_KEEP_LINES = 2000           // 轮转保留行数
 const RUNLOG_MAX_LINES = 4000         // 单次运行输出缓冲上限（防长期驻留内存膨胀）
+const NODE_PROBE_TIMEOUT_MS = 5000    // 预检 node --version 超时：正常毫秒级返回，仅为慢盘/杀软扫描兜底
 
 const APP_ID = 'com.dsh.launcher'
 app.setAppUserModelId(APP_ID)
@@ -279,10 +280,135 @@ function waitPortFree(timeoutMs = PORT_FREE_TIMEOUT_MS) {
   })
 }
 
+// ---------------------------------------------------------------- preflight
+// 拉起前的静态检查：把"node 不在 PATH / node 版本过旧 / 依赖未安装 / dshDir 配错"
+// 这类必然失败的启动翻译成可行动的提示，而不是让用户去读 spawn 后的底层报错。
+// 只检查 startCmd 自身引用到的东西；自定义命令不引用的项一律跳过。
+// DSH package.json 读不到或 engines.node 无法解析时的兜底约束（与当前 DSH 一致）。
+// 正常路径一律读实时 engines，避免 DSH 调整版本要求后这里静默漂移。
+const FALLBACK_ENGINES = '^22.19.0 || >=24.0.0'
+
+// 'v22.19.0' → [22,19,0]；带预发布后缀（v24.0.0-rc.1）等不可解析输入返回 null（fail-open，
+// 交由真实启动暴露问题）。
+function parseVersionTuple(text) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(text).trim())
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null
+}
+
+function versionCmp(a, b) {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1
+  }
+  return 0
+}
+
+// 解析 engines.node 约束：支持 `^x.y.z`、`>=x.y.z`、精确 `x.y.z`，`||` 分隔任一满足即可。
+// 含无法识别的子句时整体返回 null：调用方回退 FALLBACK_ENGINES，而不是误拦或误放。
+function parseEnginesRange(text) {
+  const clauses = String(text || '').split('||').map((s) => s.trim()).filter(Boolean)
+  if (!clauses.length) return null
+  const checks = []
+  for (const clause of clauses) {
+    const m = /^(\^|>=)?v?(\d+)\.(\d+)\.(\d+)$/.exec(clause)
+    if (!m) return null
+    checks.push({ op: m[1] || '=', min: [Number(m[2]), Number(m[3]), Number(m[4])] })
+  }
+  return {
+    text: String(text).trim(),
+    satisfied(v) {
+      return checks.some((k) => {
+        const c = versionCmp(v, k.min)
+        if (k.op === '>=') return c >= 0
+        if (k.op === '^') {
+          // npm 语义：^x.y.z 锁主版本；0.x 锁到次版本（0.2.3 允许 0.2.9），0.0.z 等价精确
+          if (v[0] !== k.min[0]) return false
+          if (k.min[0] > 0) return c >= 0
+          if (k.min[1] > 0) return v[1] === k.min[1] && v[2] >= k.min[2]
+          return c === 0
+        }
+        return c === 0
+      })
+    },
+  }
+}
+
+// 读 DSH 根 package.json 的 engines.node；读不到或解析不了时回退内置约束。
+function readEnginesRange() {
+  let raw = null
+  try {
+    raw = JSON.parse(fs.readFileSync(path.join(cfg.dshDir, 'package.json'), 'utf8')).engines?.node ?? null
+  } catch { raw = null }
+  if (typeof raw === 'string') {
+    const range = parseEnginesRange(raw)
+    if (range) return range
+  }
+  return parseEnginesRange(FALLBACK_ENGINES)
+}
+
+function detectNodeVersion(cmd) {
+  try {
+    const r = spawnSync(cmd, ['--version'], { windowsHide: true, timeout: NODE_PROBE_TIMEOUT_MS, encoding: 'utf8' })
+    if (r.error) {
+      // ENOENT：PATH 上没有该命令，真实 spawn 同样会失败，但这里能给出可行动的提示
+      if (r.error.code === 'ENOENT') return { missing: true, tuple: null, text: '' }
+      return { missing: false, tuple: null, text: r.error.message }
+    }
+    const v = typeof r.stdout === 'string' ? r.stdout.trim() : ''
+    return { missing: false, tuple: r.status === 0 ? parseVersionTuple(v) : null, text: v || '(无输出)' }
+  } catch (e) {
+    return { missing: false, tuple: null, text: (e && e.message) || '(检测失败)' }
+  }
+}
+
+// `--import tsx/esm`（或以路径分隔符结尾的裸 tsx）。不能放宽为"以 tsx 结尾"：
+// 自定义命令里的 my-tool.tsx、--flag=tsx 会被误判为依赖 tsx 而遭拦截。
+function isTsxArg(arg) {
+  return /(^|[\\/])tsx([\\/]esm)?$/.test(String(arg))
+}
+
+function runPreflight() {
+  const cmdArgs = cfg.startCmd.map((a) => String(a))
+  const refsBinTs = cmdArgs.some((a) => a.replace(/\\/g, '/').includes('apps/cli/src/bin.ts'))
+  const isDshSourceCmd = cmdArgs.some(isTsxArg) || refsBinTs
+  // 源码入口：命令引用了 bin.ts 才检查，避免误伤不经过源码入口的自定义命令
+  if (refsBinTs
+    && !fs.existsSync(path.join(cfg.dshDir, 'apps', 'cli', 'src', 'bin.ts'))) {
+    return `DSH 目录里找不到 apps\\cli\\src\\bin.ts（dshDir: ${cfg.dshDir}），请检查 settings.json 的 dshDir`
+  }
+  // tsx 依赖：`--import tsx/esm` 源码启动必需，缺失时 node 的模块解析报错很难定位
+  if (cmdArgs.some(isTsxArg) && !fs.existsSync(path.join(cfg.dshDir, 'node_modules', 'tsx'))) {
+    return 'DSH 依赖未安装（缺少 node_modules\\tsx）：请在 DSH 目录执行 pnpm install 后重试'
+  }
+  // node 版本：仅对源码启动命令检查——DSH 的 engines 不约束用户自定义的其他 node 程序；
+  // 每次拉起现查（~100ms），升级 Node 后无需重启启动器
+  const cmd = cmdArgs[0] || ''
+  if (isDshSourceCmd && /^(?:node|node\.exe)$/i.test(path.basename(cmd))) {
+    const d = detectNodeVersion(cmd)
+    if (d.missing) return `找不到可执行的 node（${cmd}）：请确认 Node.js 已安装并在 PATH 中`
+    if (d.tuple === null) {
+      appendLog(`警告：无法检测 node 版本（${d.text}），跳过版本检查继续启动`)
+    } else {
+      const range = readEnginesRange()
+      if (!range.satisfied(d.tuple)) {
+        return `node 版本不满足 DSH 要求（${range.text}）：当前 ${d.text}，请升级 Node 后重试`
+      }
+    }
+  }
+  return null
+}
+
+// 测试钩子：test-race.js 注入临时配置，驱动 runPreflight 的各条分支（真实启动路径不使用）
+function setCfg(patch) { cfg = { ...cfg, ...patch } }
+
 function startDsh() {
   // 返回 null=已启动；返回字符串=被守卫拒绝的原因（调用方负责回滚状态）
   if (child) return '已有 DSH 子进程在运行'
   if (stopping) return '停止进行中，请稍候再试'
+  const preflightReason = runPreflight()
+  if (preflightReason) {
+    appendLog(`启动被预检拒绝: ${preflightReason}`)
+    return preflightReason
+  }
   appendLog(`启动 DSH: ${cfg.startCmd.join(' ')}  (cwd: ${cfg.dshDir})`)
   childStartAt = Date.now()
   slowBootNotified = false
@@ -438,7 +564,9 @@ function startDsh() {
         cfg.noOpen = false
         saveSettings({ startCmd: cfg.startCmd, noOpen: false })
         setState({ value: 'starting' })
-        startDsh()
+        // 回退重入也走统一收尾：拒绝（理论上极难发生，同命令几秒前刚通过预检）
+        // 时同样置 failed + 弹泡，不留"启动中"悬置态
+        startDshOrFail()
         return
       }
       // 如果是主动停止触发的退出，不弹通知
@@ -509,24 +637,55 @@ function stopDsh() {
   return stopPromise
 }
 
-async function restartDsh() {
+// 重启时重新武装 --no-open 回退：上次回退只针对当时运行中的 DSH 版本，
+// DSH 更新后可能已原生支持该选项；重启时恢复 --no-open 让回退逻辑重新裁决
+// （若仍不支持，startDsh 的快速失败路径会再次回退并持久化）。
+function rearmNoOpenFallback() {
+  if (!noOpenFallbackUsed) return
+  noOpenFallbackUsed = false
+  if (!cfg.startCmd.includes('--no-open') && isWebCommand(cfg.startCmd)) {
+    cfg.startCmd.push('--no-open')
+    cfg.noOpen = true
+    saveSettings({ startCmd: cfg.startCmd, noOpen: true })
+  }
+}
+
+// 拉起并把拒绝统一收尾：记日志、翻转为 failed、弹泡给出可行动的原因。
+// 返回 null=已拉起（状态 starting）；返回字符串=被拒绝的原因。
+function startDshOrFail() {
+  const reason = startDsh()
+  if (reason) {
+    appendLog(`启动 DSH 被拒绝: ${reason}`)
+    setState({ value: 'failed', pid: null })
+    notify('DSH 启动失败', reason)
+    return reason
+  }
+  setState({ value: 'starting' })
+  return null
+}
+
+// 停止 → 等端口释放 → 重新拉起的共享流程（托盘"重新启动 DSH"、重试超时强杀、
+// 接管外部 DSH 共用）。返回值同 startDshOrFail。
+async function relaunchDsh() {
+  rearmNoOpenFallback()
   await stopDsh()
   setState({ value: 'starting' })
-  if (await waitPortFree()) {
-    startDsh()
-  } else {
+  if (!(await waitPortFree())) {
     appendLog('端口未释放，已取消自动重启；请稍后重试')
     setState({ value: 'failed', pid: null })
+    notify('DSH 启动失败', `端口 ${state.port} 迟迟未释放，已取消自动重启；请稍后重试`)
+    return '端口未释放'
   }
+  return startDshOrFail()
 }
 
 // 探测循环：PROBE_INTERVAL_MS 一次。服务假死时单次探测可挂起数秒（超时 5s > 周期 2s），
 // 用 probing 标志跳过重叠周期，避免请求无限堆积。
 function ensureRunning() {
-  if (probing) return
+  if (probing || quitting) return
   probing = true
   isUp().then(async (status) => {
-    if (stopping) return   // 停止过程中不推进状态机，避免竞态误报
+    if (stopping || quitting) return   // 停止/退出过程中不推进状态机，避免竞态误报
     if (status === 'up') {
       // stopped/failed 是用户主动停止或启动失败的明确状态：端口被残留进程占用
       // 返回 2xx 时不得自动翻转为 ready（与用户停止意图矛盾），交给用户点"重试"。
@@ -579,8 +738,9 @@ function ensureRunning() {
     }
     if (state.value === 'degraded') return
     if (state.value === 'idle') {
-      setState({ value: 'starting' })
-      startDsh()
+      // 预检拒绝时 startDshOrFail 会置 failed 并弹泡：
+      // 否则 starting 且无子进程、childStartAt=0，探测循环无分支命中，UI 永远停在"启动中"
+      startDshOrFail()
       return
     }
     if (state.value === 'starting' && childStartAt > 0 && Date.now() - childStartAt > START_BUDGET_MS) {
@@ -706,7 +866,7 @@ function createTray() {
     { label: '打开 DSH 目录', click: () => shell.openPath(cfg.dshDir) },
     { label: '打开配置目录', click: () => shell.openPath(path.dirname(settingsFile())) },
     { type: 'separator' },
-    { label: '重新启动 DSH', click: () => restartDsh() },
+    { label: '重新启动 DSH', click: () => relaunchDsh() },
     { label: '停止 DSH', click: () => stopDsh() },
     { type: 'separator' },
     {
@@ -768,23 +928,18 @@ ipcMain.handle('launcher:retry', async () => {
       return
     }
     appendLog('接管外部 DSH：停止后由本启动器重新启动…')
-    await stopDsh()
-    await waitPortFree()
-    const reason = startDsh()
-    if (reason) {
-      appendLog(`启动 DSH 被拒绝: ${reason}`)
-      setState({ value: 'failed' })
-    } else {
-      setState({ value: 'starting' })
-    }
+    await relaunchDsh()
     return
   }
   if (!child) {
+    rearmNoOpenFallback()
+    // 拒绝收尾（failed + 弹泡）与 startDshOrFail 一致，但保留本分支特有的
+    // 回滚语义：守卫拒绝（停止进行中等极窄窗口）回滚 starting，避免卡死等待
     const reason = startDsh()
     if (reason) {
-      // 守卫拒绝（停止进行中等极窄窗口）：回滚 starting，避免卡死等待
       appendLog(`启动 DSH 被拒绝: ${reason}`)
       setState({ value: state.value === 'starting' ? 'failed' : state.value })
+      notify('DSH 启动失败', reason)
     } else {
       setState({ value: 'starting' })
     }
@@ -795,15 +950,7 @@ ipcMain.handle('launcher:retry', async () => {
   const elapsedMs = childStartAt > 0 ? Date.now() - childStartAt : 0
   if (elapsedMs > START_BUDGET_MS) {
     appendLog(`重试：DSH ${Math.round(elapsedMs / 1000)} 秒未就绪，终止后重新拉起`)
-    await stopDsh()
-    await waitPortFree()
-    const reason = startDsh()
-    if (reason) {
-      appendLog(`重启 DSH 被拒绝: ${reason}`)
-      setState({ value: 'failed' })
-    } else {
-      setState({ value: 'starting' })
-    }
+    await relaunchDsh()
   } else {
     appendLog(`DSH 仍在启动中（已 ${Math.round(elapsedMs / 1000)} 秒），继续等待…`)
     setState({ value: 'starting' })
@@ -871,4 +1018,9 @@ if (!app.requestSingleInstanceLock()) {
 
 app.on('window-all-closed', () => { /* 托盘驻留，不退出 */ })
 
-app.on('before-quit', () => { quitting = true })
+app.on('before-quit', () => {
+  quitting = true
+  // 退出时停掉探测周期：避免退出窗口内 setInterval 再触发一次探测/日志写入
+  if (probeTimer) clearInterval(probeTimer)
+  probeTimer = null
+})
