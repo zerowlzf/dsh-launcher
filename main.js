@@ -89,15 +89,23 @@ function sleepSync(ms) {
 
 const ATOMIC_RENAME_RETRY_CODES = new Set(['EACCES', 'EBUSY', 'EPERM'])
 
-// 原子写配置：临时文件 + rename。直接 writeFileSync 在窗口拖动/令牌捕获这类高频写入下，
-// 崩溃、断电或杀软扫描打断会留下截断的 JSON，loadSettings 只能改名备份并回退默认值——
-// 用户的 port/dshDir/bounds 与持久化令牌会静默丢失。
+// 原子写配置：临时文件 + fsync + rename。直接 writeFileSync 在窗口拖动/令牌捕获这类
+// 高频写入下，进程被杀或杀软扫描打断会留下截断的 JSON，loadSettings 只能改名备份并回退
+// 默认值——用户的 port/dshDir/bounds 与持久化令牌会静默丢失。
+// fsync 后再 rename：rename 只保证命名空间原子，掉电时内容仍可能没落盘；先 flush 才能让
+// "要么旧文件、要么完整新文件"成立。
 // Windows 上 rename 覆盖被扫描器持有的文件会报 EPERM/EBUSY，按上游 atomic-write 的做法退避重试。
-// mode 0600：settings.json 含启动令牌。
+// mode 0600：settings.json 含启动令牌（Windows 上 mode 基本无效，靠用户目录 ACL）。
 function writeFileAtomicSync(file, content) {
   fs.mkdirSync(path.dirname(file), { recursive: true })
   const tmp = `${file}.${process.pid.toString(36)}${Math.random().toString(36).slice(2, 8)}.tmp`
-  fs.writeFileSync(tmp, content, { mode: 0o600, flag: 'wx' })
+  const fd = fs.openSync(tmp, 'wx', 0o600)
+  try {
+    fs.writeFileSync(fd, content)
+    fs.fsyncSync(fd)
+  } finally {
+    fs.closeSync(fd)
+  }
   let waitMs = 20
   for (let attempt = 0; ; attempt++) {
     try {
@@ -497,15 +505,17 @@ const CHILD_ENV = Object.fromEntries(Object.entries(process.env).filter(([name])
 // 返回 null 表示无匹配，调用方使用通用文案。
 function classifyExit(runLog, code) {
   if (code === 130) return 'DSH 被中断（SIGINT）'
-  const fatal = runLog.match(/^(?:ERR )?dsh: (?:fatal load failure|host preparation failed|plugin tree failed to load):.*$/m)
-  if (fatal) return fatal[0].replace(/^ERR /, '').trim()
+  const firstLine = (re) => {
+    const m = runLog.match(re)
+    return m === null ? null : m[0].replace(/^ERR /, '').trim()
+  }
+  const fatal = firstLine(/^(?:ERR )?dsh: (?:fatal load failure|host preparation failed|plugin tree failed to load):.*$/m)
+  if (fatal !== null) return fatal
   // DSH 更新后未重装依赖（如工作区改名）会以模块解析失败告终
   if (/ERR_MODULE_NOT_FOUND|Cannot find (?:module|package)/i.test(runLog)) {
     return '依赖未安装或与当前源码不匹配（模块解析失败）：请在 DSH 目录执行 pnpm install 后重试'
   }
-  const usage = runLog.match(/^(?:ERR )?error: .*$/m)
-  if (usage) return usage[0].replace(/^ERR /, '').trim()
-  return null
+  return firstLine(/^(?:ERR )?error: .*$/m)
 }
 
 // 等待子进程真正退出（exit 事件 + 上限），用于停止后确认，避免 UI 谎报"已停止"。
@@ -757,12 +767,12 @@ function stopDsh() {
       // 确认子进程真的退出：taskkill 是强杀，正常瞬时；未确认时明确告知而不是静默
       // 宣告"已停止"（残留进程会继续占着端口，直到下次拉起时的 waitPortFree 才发现）。
       const stoppingChild = child
-      if (child) {
-        try { child.kill() } catch { /* ignore */ }
-      }
-      if (stoppingChild && !(await exitsWithin(stoppingChild, STOP_CONFIRM_MS))) {
-        appendLog(`停止未确认：DSH 进程 ${stoppingChild.pid} 在 ${STOP_CONFIRM_MS / 1000} 秒内未退出，端口 ${state.port} 可能仍被占用`)
-        notify('DSH 停止未确认', `进程 ${stoppingChild.pid} 未在 ${STOP_CONFIRM_MS / 1000} 秒内退出，可能仍在运行；请查看日志。`)
+      if (stoppingChild) {
+        try { stoppingChild.kill() } catch { /* ignore */ }
+        if (!(await exitsWithin(stoppingChild, STOP_CONFIRM_MS))) {
+          appendLog(`停止未确认：DSH 进程 ${stoppingChild.pid} 在 ${STOP_CONFIRM_MS / 1000} 秒内未退出，端口 ${state.port} 可能仍被占用`)
+          notify('DSH 停止未确认', `进程 ${stoppingChild.pid} 未在 ${STOP_CONFIRM_MS / 1000} 秒内退出，可能仍在运行；请查看日志。`)
+        }
       }
       child = null
       childStartAt = 0
@@ -826,8 +836,9 @@ async function relaunchDsh() {
   setState({ value: 'starting' })
   if (!(await waitPortFree())) {
     appendLog('端口未释放，已取消自动重启；请稍后重试')
-    failStart(`端口 ${state.port} 迟迟未释放，已取消自动重启；请稍后重试`)
-    return '端口未释放'
+    const reason = `端口 ${state.port} 迟迟未释放，已取消自动重启；请稍后重试`
+    failStart(reason)
+    return { reason, transient: false }
   }
   return startDshOrFail()
 }
