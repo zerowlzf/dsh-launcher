@@ -132,6 +132,14 @@ function applyStatus(s) {
 // 只能跟踪自己最后一次设置的值。
 let lastSetUrl = ''
 
+// 访客是否已开始加载：元素未升级（getURL 不存在）或停在 about:blank 都算没开始。
+function guestLoadStarted() {
+  try {
+    const url = view.getURL()
+    return typeof url === 'string' && url !== '' && url !== 'about:blank'
+  } catch { return false }
+}
+
 function ensureWebviewLoaded(retries) {
   const target = currentUrl
   if (lastSetUrl === target && viewReady) {
@@ -141,14 +149,20 @@ function ensureWebviewLoaded(retries) {
 
   view.style.display = ''
   viewReady = false
-  if (lastSetUrl !== target) {
+  // 关键：<webview> 自定义元素升级完成前给 .src 赋值只会写到一个普通属性上，元素升级后
+  // 仍按初始 src="about:blank" 建访客，赋值被静默丢弃 —— 状态就绪得越早（DSH 已在运行、
+  // 首个探测立刻成功）越容易踩中，表现是标题栏"运行中"而内容区全黑。
+  // setAttribute 直接改 DOM 属性，升级前后都有效；再按"访客是否真的开始加载"决定是否补发。
+  if (lastSetUrl !== target || !guestLoadStarted()) {
     lastSetUrl = target
-    view.src = target
+    view.setAttribute('src', target)
   }
+
   clearTimeout(ensureTimer)
   ensureTimer = setTimeout(() => {
-    if (currentState === 'ready' && lastSetUrl !== currentUrl && retries > 0) {
-      console.log('webview src 未生效，重试剩余', retries)
+    // 只在访客完全没开始加载时重试：已开始的加载不能重设 src，否则会把正在启动的页面打断
+    if (currentState === 'ready' && !guestLoadStarted() && retries > 0) {
+      console.log('webview 未开始加载，重试剩余', retries)
       ensureWebviewLoaded(retries - 1)
     }
   }, 1200)

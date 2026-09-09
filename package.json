@@ -6,7 +6,7 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "test": "node test-race.js"
+    "test": "node test-race.js && node test-webview.js"
   },
   "devDependencies": {
     "electron": "^43.4.1"
