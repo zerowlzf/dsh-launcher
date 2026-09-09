@@ -1,6 +1,6 @@
 // DSH 桌面启动器 — main process
 // Win11 风格炭黑窗口 · 托盘驻留 · 自动探测/启动/停止 DSH（源码版）
-const { app, BrowserWindow, Tray, Menu, shell, nativeImage, ipcMain, screen } = require('electron')
+const { app, BrowserWindow, Tray, Menu, shell, nativeImage, ipcMain, screen, dialog } = require('electron')
 const { spawn, execFile } = require('child_process')
 const fs = require('fs')
 const path = require('path')
@@ -279,6 +279,14 @@ function waitPortFree(timeoutMs = PORT_FREE_TIMEOUT_MS) {
   })
 }
 
+// DSH 子进程继承的环境变量：剥离 shell/调试器污染项（对齐官方桌面端
+// apps/desktop host-process.ts 的做法）。用户从设置了 NODE_OPTIONS 等变量的终端
+// 启动本启动器时，原样继承会导致 DSH 子进程启动失败或行为异常。
+// 只做黑名单剥离：PATH 等正常变量保持原样，node 仍能从 PATH 解析。
+const CHILD_ENV = Object.fromEntries(Object.entries(process.env).filter(([name]) => (
+  name !== 'NODE_OPTIONS' && !/^(?:npm|pnpm|corepack)_/i.test(name)
+)))
+
 function startDsh() {
   // 返回 null=已启动；返回字符串=被守卫拒绝的原因（调用方负责回滚状态）
   if (child) return '已有 DSH 子进程在运行'
@@ -383,6 +391,7 @@ function startDsh() {
     // （停止→立即重启的竞态），只有"仍是当前进程"的退出才允许改写全局状态。
     const c = spawn(cfg.startCmd[0], cfg.startCmd.slice(1), {
       cwd: cfg.dshDir,
+      env: CHILD_ENV,
       windowsHide: true,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -579,8 +588,11 @@ function ensureRunning() {
     }
     if (state.value === 'degraded') return
     if (state.value === 'idle') {
-      setState({ value: 'starting' })
-      startDsh()
+      // 与 launcher:retry 相同模式：先 startDsh，成功才置 starting。
+      // 守卫拒绝（如停止恰好进行中）时保持 idle，由下轮探测重试，避免状态卡死。
+      const reason = startDsh()
+      if (reason) appendLog(`启动 DSH 被拒绝: ${reason}`)
+      else setState({ value: 'starting' })
       return
     }
     if (state.value === 'starting' && childStartAt > 0 && Date.now() - childStartAt > START_BUDGET_MS) {
@@ -809,10 +821,6 @@ ipcMain.handle('launcher:retry', async () => {
     setState({ value: 'starting' })
   }
 })
-ipcMain.handle('launcher:openExternal', (_e, url) => {
-  // webview 内 window.open 的外部链接：仅放行 http/https，交给系统浏览器
-  if (typeof url === 'string' && /^https?:\/\//i.test(url)) shell.openExternal(url)
-})
 ipcMain.handle('launcher:stopDsh', () => stopDsh())
 ipcMain.handle('launcher:copyLog', () => {
   const text = state.log.join('\n')
@@ -866,6 +874,14 @@ if (!app.requestSingleInstanceLock()) {
     setState({ value: 'idle', log: [] })
     ensureRunning()
     probeTimer = setInterval(ensureRunning, PROBE_INTERVAL_MS)
+  }).catch((e) => {
+    // 启动链路（窗口/托盘/session 配置）异常不能静默沉没：无 catch 时 Promise 拒绝
+    // 只在不可见的 stderr 留一行，用户面对无窗口无托盘无日志的"假死"。
+    // 对齐官方桌面端（main.ts）：写日志 + 错误弹窗 + 非零退出码。
+    const msg = e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e)
+    appendLog(`启动器初始化失败: ${msg}`)
+    try { dialog.showErrorBox('DSH 启动器初始化失败', msg.slice(0, 1000)) } catch { /* ignore */ }
+    app.exit(1)
   })
 }
 
