@@ -29,7 +29,9 @@
 |---|---|---|
 | `dsh web` 是 `--profile web` 的硬编码别名；web 参数族含 `--no-open`、`--host`、`--port`、`--trusted-host` | `apps/cli/src/args.ts`、`packages/bundle/web-app/src/startup.ts` | `startCmd` 启动参数；`--no-open` 缺失时自动补，上游不认时自动回退 |
 | 启动令牌 URL 行 `dsh web: <url>?token=...`（`printUrl` 默认 true；LAN 地址以 `(LAN: ...)` 追加在同一行） | `packages/bundle/web-app/src/index.ts` | 从 stdout 捕获令牌，拼认证 URL 加载内嵌页面 |
+| URL 行同时是**就绪信号**：只在 Loader 全部激活、Connection 可用后打印 | `packages/bundle/web-app/src/index.ts`（`announceReady` 注释与实现）、`packages/bundle/web-app/README.md` | 捕获令牌即翻转为运行中，不必等探测周期 |
 | 探测语义：2xx/3xx = 服务在；401 = 需令牌；其余 = 未就绪 | `packages/client/connection/src/browser-auth.ts` | 探测状态机（ready / 需认证 / degraded） |
+| 前端静态资源位置：web-app bundle 的 `node_modules/@deepseek-ai/dsh-web-frontend` 链接 → 该包 `dist/index.html`；缺失时服务照样绑定、令牌行照打、`/` 返回 404（上游只对缺失的 client bundle 给构建提示） | `packages/bundle/web-app/src/index.ts`（`resolveDistIndex`）、`packages/host/frontend-static/src/index.ts` | 预检据此在缺失时告警（不拦截），避免内嵌窗口静默 404 |
 | 默认 host `127.0.0.1`、默认 port `3080` | `packages/bundle/web-app/cordis.patch.yml` | 探测与内嵌 URL 默认值；端口以 URL 行自报值为准（端口漂移跟随） |
 | 源码启动须走 tsx 的 ESM 钩子（`node --import tsx/esm apps/cli/src/bin.ts`），仓库依赖中需有 `tsx`、入口文件需存在 | 根 `package.json`、`apps/cli/src/bin.ts`、`.agents/notes/implemented/architecture/2026-07-29-dsh-source-launch-tsx-esm.md` | 启动预检（缺 `node_modules/tsx` 提示 `pnpm install`、缺入口提示 `dshDir` 配错） |
 | 根 `package.json` 的 `engines.node` 是源码运行的 node 版本要求 | 根 `package.json` | 启动预检实时读取（读不到回退 `^22.19.0 \|\| >=24.0.0`），每次拉起现查 |
@@ -47,7 +49,10 @@
 |---|---|
 | 自动探测 | 启动即检查 `http://127.0.0.1:3080`，已在运行则直接内嵌显示 GUI |
 | 自动启动 | 未运行时用源码版命令拉起：`node --import tsx/esm apps/cli/src/bin.ts web --no-open`（cwd = deepseek-harness，避免重复打开系统浏览器） |
-| 启动预检 | 拉起前静态检查：源码启动命令（引用 `tsx` 或 `apps/cli/src/bin.ts`）的 node 版本须满足 DSH 根 package.json 的 `engines.node`（实时读取，读不到回退 `^22.19.0 \|\| >=24.0.0`；每次拉起现查，升级 Node 无需重启启动器）；参数为 `tsx` / `tsx/esm` 或路径形式指向 tsx 时要求 `node_modules\tsx` 已安装；命令引用了 `apps/cli/src/bin.ts` 时确认入口存在。不满足则不启动，日志与托盘弹泡给出可行动的提示（如"请在 DSH 目录执行 pnpm install"），替代难懂的底层报错。只检查 startCmd 自身引用到的项，自定义命令（如 `node my-tool.tsx`、`node my-server.js`）不受影响 |
+| 启动预检 | 拉起前静态检查：源码启动命令（引用 `tsx` 或 `apps/cli/src/bin.ts`）的 node 版本须满足 DSH 根 package.json 的 `engines.node`（实时读取，读不到回退 `^22.19.0 \|\| >=24.0.0`；每次拉起现查，升级 Node 无需重启启动器）；参数为 `tsx` / `tsx/esm` 或路径形式指向 tsx 时要求 `node_modules\tsx` 已安装；命令引用了 `apps/cli/src/bin.ts` 时确认入口存在。以上不满足则不启动，日志与托盘弹泡给出可行动的提示（如"请在 DSH 目录执行 pnpm install"），替代难懂的底层报错。只检查 startCmd 自身引用到的项，自定义命令（如 `node my-tool.tsx`、`node my-server.js`）不受影响。另有一项**只告警不拦截**的检查：源码启动 + `web` 时按 web-app bundle 的 `node_modules` 链接解析前端包，缺 `dist\index.html` 时提示 `pnpm run build`（不拦截，避免误伤前端用 Vite 开发、只借启动器拉起 `dsh web` 的工作流） |
+| 就绪判定 | 以 DSH 打印的 `dsh web:` URL 行为就绪信号（上游契约：该行在 Loader 全部激活、Connection 可用后才打印），捕获令牌即翻转为运行中，不必等下一轮探测；探测循环继续负责存活与断线恢复 |
+| 失败原因翻译 | 子进程启动期退出时按上游稳定输出分类并直接给出原因：`dsh: fatal load failure:` / `host preparation failed:` / `plugin tree failed to load:`（原样透出）、模块解析失败（提示 `pnpm install`）、`error:` 用法错误、退出码 130（用户中断）；无匹配才回退"请查看日志" |
+| 停止确认 | 停止后等待子进程退出事件（上限 3 秒）才宣告已停止；`taskkill` 失败或进程未退出时记日志并弹泡告知，不静默谎报 |
 | 现代化窗口 | Win11 圆角、无边框、系统窗口按钮（titleBarOverlay）、淡炭黑主题 |
 | 启动状态页 | 动画 + DSH 实时输出日志（滚动保留 200 行），失败可一键重试 |
 | 托盘驻留 | 关窗 = 最小化到托盘；托盘菜单：显示窗口 / 浏览器打开 / 打开 DSH 目录 / 打开配置目录 / 重启 DSH / 停止 DSH / 开机自启 / 退出 |
@@ -74,7 +79,8 @@
 - `dshDir` 默认会优先使用启动器同级的 `deepseek-harness` 目录；如果不存在，再回退到旧版硬编码路径。
 - 如果旧配置里的 `startCmd` 是 `web` 且缺少 `--no-open`，启动器会自动补上并写回配置。
 - `noOpen` 控制是否自动追加 `--no-open`；如果某天 DSH 不再支持该参数，启动器会自动去掉它并写回 `"noOpen": false`。
-- 启动 DSH 子进程时会剥离 `NODE_OPTIONS` 与 `npm_*`/`pnpm_*`/`corepack_*` 环境变量（对齐官方桌面端做法），避免终端里的调试配置（如 `--inspect`）污染 DSH；其余变量（含 `PATH`）正常继承。需要给 DSH 传 Node 选项时请直接写进 `startCmd`（如 `"node", "--max-old-space-size=4096", ...`）。
+- 启动 DSH 子进程时会剥离 `NODE_OPTIONS`、`DSH_DESKTOP_*` 与 `npm_*`/`pnpm_*`/`corepack_*` 环境变量（对齐官方桌面端做法），避免终端里的调试配置（如 `--inspect`）污染 DSH、也不让桌面端私有变量漏进 web 子进程；其余变量（含 `PATH`、`DSH_HOME`、代理变量）正常继承，需要给 DSH 传 Node 选项时请直接写进 `startCmd`（如 `"node", "--max-old-space-size=4096", ...`）。
+- `settings.json` 采用「临时文件 + rename」原子写（含令牌，写入权限 0600），窗口拖动/令牌捕获这类高频写入不会因中断留下截断的 JSON。
 - 改完重启启动器生效。窗口位置/大小自动记忆。
 
 ## 日志

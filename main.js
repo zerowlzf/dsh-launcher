@@ -27,6 +27,7 @@ const LOG_MAX_BYTES = 2 * 1024 * 1024 // dsh.log 轮转阈值
 const LOG_KEEP_LINES = 2000           // 轮转保留行数
 const RUNLOG_MAX_LINES = 4000         // 单次运行输出缓冲上限（防长期驻留内存膨胀）
 const NODE_PROBE_TIMEOUT_MS = 5000    // 预检 node --version 超时：正常毫秒级返回，仅为慢盘/杀软扫描兜底
+const STOP_CONFIRM_MS = 3000          // 停止后确认子进程真正退出的上限（taskkill 是强杀，正常瞬时）
 
 const APP_ID = 'com.dsh.launcher'
 app.setAppUserModelId(APP_ID)
@@ -78,11 +79,45 @@ function loadSettings() {
   return s
 }
 
+// 同步退避：只用于 rename 被占用时的极短重试。Atomics.wait 会阻塞主进程事件循环，
+// 但仅在文件被占用时进入，单次最长 200ms、总计约 1s，远优于写坏配置文件。
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  } catch { /* 环境不支持共享内存时退化为立即重试 */ }
+}
+
+const ATOMIC_RENAME_RETRY_CODES = new Set(['EACCES', 'EBUSY', 'EPERM'])
+
+// 原子写配置：临时文件 + rename。直接 writeFileSync 在窗口拖动/令牌捕获这类高频写入下，
+// 崩溃、断电或杀软扫描打断会留下截断的 JSON，loadSettings 只能改名备份并回退默认值——
+// 用户的 port/dshDir/bounds 与持久化令牌会静默丢失。
+// Windows 上 rename 覆盖被扫描器持有的文件会报 EPERM/EBUSY，按上游 atomic-write 的做法退避重试。
+// mode 0600：settings.json 含启动令牌。
+function writeFileAtomicSync(file, content) {
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const tmp = `${file}.${process.pid.toString(36)}${Math.random().toString(36).slice(2, 8)}.tmp`
+  fs.writeFileSync(tmp, content, { mode: 0o600, flag: 'wx' })
+  let waitMs = 20
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.renameSync(tmp, file)
+      return
+    } catch (e) {
+      if (attempt >= 8 || !ATOMIC_RENAME_RETRY_CODES.has(e.code)) {
+        try { fs.unlinkSync(tmp) } catch { /* 临时文件可能已不存在，忽略 */ }
+        throw e
+      }
+      sleepSync(waitMs)
+      waitMs = Math.min(waitMs * 2, 200)
+    }
+  }
+}
+
 function saveSettings(patch) {
   const s = { ...loadSettings(), ...patch }
   try {
-    fs.mkdirSync(path.dirname(settingsFile()), { recursive: true })
-    fs.writeFileSync(settingsFile(), JSON.stringify(s, null, 2))
+    writeFileAtomicSync(settingsFile(), JSON.stringify(s, null, 2))
   } catch (e) {
     console.error('saveSettings failed:', e)
   }
@@ -366,6 +401,18 @@ function isTsxArg(arg) {
   return /(^|[\\/])tsx([\\/]esm)?$/.test(String(arg))
 }
 
+// Web GUI 静态资源：`dsh web` 由 frontend-static 按请求读前端包的 dist/index.html，
+// 文件缺失时服务照样绑定、令牌行照样打印，内嵌窗口只会得到 404（上游只对缺失的
+// client bundle 给出构建提示，不含前端 dist）。
+// 锚点与上游一致：从 web-app bundle 的 node_modules 链接解析前端包（pnpm 工作区链接），
+// 不硬编码 apps/web 目录；链接不存在时返回 null，不在预检里臆测，交给启动后的真实报错。
+function webDistIndex() {
+  const link = path.join(cfg.dshDir, 'packages', 'bundle', 'web-app', 'node_modules', '@deepseek-ai', 'dsh-web-frontend')
+  try {
+    return path.join(fs.realpathSync(link), 'dist', 'index.html')
+  } catch { return null }
+}
+
 function runPreflight() {
   const cmdArgs = cfg.startCmd.map((a) => String(a))
   const refsBinTs = cmdArgs.some((a) => a.replace(/\\/g, '/').includes('apps/cli/src/bin.ts'))
@@ -378,6 +425,16 @@ function runPreflight() {
   // tsx 依赖：`--import tsx/esm` 源码启动必需，缺失时 node 的模块解析报错很难定位
   if (cmdArgs.some(isTsxArg) && !fs.existsSync(path.join(cfg.dshDir, 'node_modules', 'tsx'))) {
     return 'DSH 依赖未安装（缺少 node_modules\\tsx）：请在 DSH 目录执行 pnpm install 后重试'
+  }
+  // 前端静态资源：只对「源码启动 + web profile」检查。缺失时服务照样能起，但内嵌窗口
+  // 只会得到 404——这里只告警不拦截：拦截会误伤"前端用 Vite 开发、只借启动器拉起 dsh web"
+  // 的既有工作流，而告警已经能把静默 404 变成可行动的提示。
+  if (isDshSourceCmd && isWebCommand(cmdArgs)) {
+    const distIndex = webDistIndex()
+    if (distIndex && !fs.existsSync(distIndex)) {
+      appendLog(`警告：DSH 前端资源未构建（缺少 ${distIndex}），内嵌页面会 404；请在 DSH 目录执行 pnpm run build（只重建前端可用 pnpm run build:web）`)
+      notify('DSH 前端未构建', '内嵌页面会 404，请在 DSH 目录执行 pnpm run build')
+    }
   }
   // node 版本：仅对源码启动命令检查——DSH 的 engines 不约束用户自定义的其他 node 程序；
   // 每次拉起现查（~100ms），升级 Node 后无需重启启动器
@@ -404,9 +461,41 @@ function setCfg(patch) { cfg = { ...cfg, ...patch } }
 // apps/desktop/src/host-process.ts 的做法）。用户从设置了 NODE_OPTIONS 等变量的终端
 // 启动本启动器时，原样继承会导致 DSH 子进程启动失败或行为异常。
 // 只做黑名单剥离：PATH 等正常变量保持原样，node 仍能从 PATH 解析。
+// DSH_DESKTOP_* 一并剥离：那是官方桌面端的私有变量，web 子进程不该继承（边界）。
 const CHILD_ENV = Object.fromEntries(Object.entries(process.env).filter(([name]) => (
-  name !== 'NODE_OPTIONS' && !/^(?:npm|pnpm|corepack)_/i.test(name)
+  name !== 'NODE_OPTIONS'
+  && !/^DSH_DESKTOP_/i.test(name)
+  && !/^(?:npm|pnpm|corepack)_/i.test(name)
 )))
+
+// 子进程退出原因分类：把 DSH 稳定的 stderr 前缀与退出码翻译成可行动的提示，
+// 而不是让用户自己去翻日志。上游契约：profile-boot 对 SIGTERM 退出 0、SIGINT 退出 130；
+// app-boot 打印 `dsh: fatal load failure:` / `dsh: host preparation failed:` /
+// `dsh: plugin tree failed to load:`；commander 用法错误打印 `error: `。
+// 返回 null 表示无匹配，调用方使用通用文案。
+function classifyExit(runLog, code) {
+  if (code === 130) return 'DSH 被中断（SIGINT）'
+  const fatal = runLog.match(/^dsh: (?:fatal load failure|host preparation failed|plugin tree failed to load):.*$/m)
+  if (fatal) return fatal[0].trim()
+  // DSH 更新后未重装依赖（如工作区改名）会以模块解析失败告终
+  if (/ERR_MODULE_NOT_FOUND|Cannot find (?:module|package)/i.test(runLog)) {
+    return '依赖未安装或与当前源码不匹配（模块解析失败）：请在 DSH 目录执行 pnpm install 后重试'
+  }
+  const usage = runLog.match(/^error: .*$/m)
+  if (usage) return usage[0].trim()
+  return null
+}
+
+// 等待子进程真正退出（exit 事件 + 上限），用于停止后确认，避免 UI 谎报"已停止"。
+// 定时器 unref：绝不因为这个确认等待而拖住应用退出。
+function exitsWithin(proc, timeoutMs) {
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs)
+    if (timer.unref) timer.unref()
+    proc.once('exit', () => { clearTimeout(timer); resolve(true) })
+  })
+}
 
 function startDsh() {
   // 返回 null=已启动；返回 { reason, transient }=被守卫/预检拒绝。
@@ -492,6 +581,14 @@ function startDsh() {
           saveSettings({ token })
           appendLog(`已捕获 DSH 启动令牌，切换到认证 URL`)
           if (tray) tray.setToolTip(`DSH 启动器 · ${baseUrl()}`)
+          // URL 行是上游公开的就绪信号（Loader 全部激活、Connection 可用后才打印），
+          // 不必等下一轮 2 秒探测：立刻翻 ready，让内嵌页面马上开始加载。
+          // 只从 starting/degraded 翻转：stopped/failed 是用户意图或失败态，不得覆盖。
+          if (state.value === 'starting' || state.value === 'degraded') {
+            const recovered = state.value === 'degraded'
+            setState({ value: 'ready', pid: child?.pid ?? null })
+            notify(recovered ? 'DSH 已恢复' : 'DSH 已就绪', recovered ? '连接已重新建立。' : `${baseUrl()} 可以访问了。`)
+          }
         }
       } catch { /* 非 URL 行，忽略 */ }
     }
@@ -583,9 +680,12 @@ function startDsh() {
       // 如果是主动停止触发的退出，不弹通知
       if (!stopping && (state.value === 'ready' || state.value === 'starting' || state.value === 'degraded')) {
         if (state.value === 'starting') {
-          // 从未就绪就退出 = 启动失败（区别于用户主动停止）
+          // 从未就绪就退出 = 启动失败（区别于用户主动停止）。
+          // 能从输出里定位原因时直接给出原因，省掉"请查看日志"这一步。
+          const why = classifyExit(runLog, code)
+          if (why) appendLog(`启动失败原因：${why}`)
           setState({ value: 'failed', pid: null })
-          notify('DSH 启动失败', '进程在就绪前退出，请查看日志后重试。')
+          notify('DSH 启动失败', why ?? '进程在就绪前退出，请查看日志后重试。')
         } else {
           setState({ value: 'stopped', pid: null })
           notify('DSH 已停止', '进程已退出，可点击托盘菜单“重新启动 DSH”。')
@@ -628,12 +728,23 @@ function stopDsh() {
       }
       if (pid) {
         appendLog(`停止 DSH (PID ${pid})`)
-        await new Promise((res) => execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => res()))
+        await new Promise((res) => execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, (err, stdout, stderr) => {
+          // taskkill 失败（如权限不足）不能让 UI 谎报已停止：记下原始原因供排查
+          if (err) appendLog(`taskkill 失败（PID ${pid}）：${String(stderr || err.message).trim()}`)
+          res()
+        }))
       }
+      // 确认子进程真的退出：taskkill 是强杀，正常瞬时；未确认时明确告知而不是静默
+      // 宣告"已停止"（残留进程会继续占着端口，直到下次拉起时的 waitPortFree 才发现）。
+      const stoppingChild = child
       if (child) {
         try { child.kill() } catch { /* ignore */ }
-        child = null
       }
+      if (stoppingChild && !(await exitsWithin(stoppingChild, STOP_CONFIRM_MS))) {
+        appendLog(`停止未确认：DSH 进程 ${stoppingChild.pid} 在 ${STOP_CONFIRM_MS / 1000} 秒内未退出，端口 ${state.port} 可能仍被占用`)
+        notify('DSH 停止未确认', `进程 ${stoppingChild.pid} 未在 ${STOP_CONFIRM_MS / 1000} 秒内退出，可能仍在运行；请查看日志。`)
+      }
+      child = null
       childStartAt = 0
       // 进程已终止，旧令牌失效：还原为无令牌基础 URL，并从持久化配置中删除
       state.token = null
