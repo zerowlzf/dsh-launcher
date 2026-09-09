@@ -16,6 +16,11 @@ const ITERATIONS = Number(process.env.WEBVIEW_ITER || 5)
 const BODY_MARKER = 'WEBVIEW_OK_MARKER'
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+// 直接解析二进制路径，不用 require('electron')：后者在 path.txt 缺失时会同步跑
+// install.js 重新下载解包整个 Electron（实测会在运行时改写 node_modules/electron/dist，
+// 恰好在此期间启动的启动器会加载到半拆包状态、preload 加载失败）。
+const ELECTRON_EXE = path.join(__dirname, 'node_modules', 'electron', 'dist', 'electron.exe')
+
 function freePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer()
@@ -94,7 +99,7 @@ async function runOnce(appDir, pageUrl, index) {
   const stubPort = new URL(pageUrl).port
   const cdpPort = await freePort()
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), `launcher-webview-ud-${index}-`))
-  const child = spawn(require('electron'), [
+  const child = spawn(ELECTRON_EXE, [
     appDir, '--hidden', `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${userData}`,
   ], { cwd: appDir, stdio: 'ignore' })
 
@@ -120,6 +125,11 @@ async function runOnce(appDir, pageUrl, index) {
 }
 
 ;(async () => {
+  if (!fs.existsSync(ELECTRON_EXE)) {
+    console.error(`找不到 Electron 可执行文件：${ELECTRON_EXE}`)
+    console.error('请先在启动器目录执行 npm install。本测试不会自行下载，避免改写 node_modules。')
+    process.exit(1)
+  }
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'launcher-webview-test-'))
   const stubPort = await freePort()
   const pageUrl = `http://127.0.0.1:${stubPort}/?token=test-token`
