@@ -169,6 +169,12 @@ function setState(patch) {
   push()
 }
 
+// "starting 且无子进程"是探测循环推不动的死状态：没有任何分支会推进它，UI 永远停在
+// "启动中"。交回 idle 让下一轮探测重新拉起（唯一从 starting 退回 idle 的出口）。
+function releaseDeadStartingState() {
+  if (state.value === 'starting' && !child) setState({ value: 'idle', pid: null })
+}
+
 function push() {
   if (win && !win.isDestroyed()) {
     win.webContents.send('launcher:status', {
@@ -367,7 +373,11 @@ function parseEnginesRange(text) {
   }
 }
 
-// 读 DSH 根 package.json 的 engines.node；读不到或解析不了时回退内置约束。
+// 读 DSH 根 package.json 的 engines.node。三种结果：
+// - 读到且可解析 → 该约束；
+// - 读不到（文件缺失/无 engines 字段）→ 内置兜底约束；
+// - 读到但解析不了（如未来的 `>=22.19.0 <26.0.0`）→ null（跳过版本检查）。
+// 最后一种不能回退兜底：拿旧约束去拦新要求会误拦合格的 node，宁可放过交给真实启动暴露。
 function readEnginesRange() {
   let raw = null
   try {
@@ -376,6 +386,8 @@ function readEnginesRange() {
   if (typeof raw === 'string') {
     const range = parseEnginesRange(raw)
     if (range) return range
+    appendLog(`警告：无法解析 DSH engines.node（${raw}），跳过 node 版本检查`)
+    return null
   }
   return parseEnginesRange(FALLBACK_ENGINES)
 }
@@ -401,16 +413,22 @@ function isTsxArg(arg) {
   return /(^|[\\/])tsx([\\/]esm)?$/.test(String(arg))
 }
 
-// Web GUI 静态资源：`dsh web` 由 frontend-static 按请求读前端包的 dist/index.html，
+// Web GUI 静态资源路径：`dsh web` 由 frontend-static 按请求读前端包的 dist/index.html，
 // 文件缺失时服务照样绑定、令牌行照样打印，内嵌窗口只会得到 404（上游只对缺失的
 // client bundle 给出构建提示，不含前端 dist）。
-// 锚点与上游一致：从 web-app bundle 的 node_modules 链接解析前端包（pnpm 工作区链接），
-// 不硬编码 apps/web 目录；链接不存在时返回 null，不在预检里臆测，交给启动后的真实报错。
-function webDistIndex() {
-  const link = path.join(cfg.dshDir, 'packages', 'bundle', 'web-app', 'node_modules', '@deepseek-ai', 'dsh-web-frontend')
-  try {
-    return path.join(fs.realpathSync(link), 'dist', 'index.html')
-  } catch { return null }
+// 解析锚点不硬编码 apps/web 目录：上游用 createRequire 从 web-app bundle 出发向上找，
+// 这里同样先查 web-app bundle 自己的 node_modules 链接（pnpm 默认布局落点），
+// 再回退根 node_modules（提升式布局）。都解析不了时返回 null，调用方只记一行日志。
+function webDistIndexPath() {
+  for (const link of [
+    path.join(cfg.dshDir, 'packages', 'bundle', 'web-app', 'node_modules', '@deepseek-ai', 'dsh-web-frontend'),
+    path.join(cfg.dshDir, 'node_modules', '@deepseek-ai', 'dsh-web-frontend'),
+  ]) {
+    try {
+      return path.join(fs.realpathSync(link), 'dist', 'index.html')
+    } catch { /* 尝试下一个锚点 */ }
+  }
+  return null
 }
 
 function runPreflight() {
@@ -430,8 +448,11 @@ function runPreflight() {
   // 只会得到 404——这里只告警不拦截：拦截会误伤"前端用 Vite 开发、只借启动器拉起 dsh web"
   // 的既有工作流，而告警已经能把静默 404 变成可行动的提示。
   if (isDshSourceCmd && isWebCommand(cmdArgs)) {
-    const distIndex = webDistIndex()
-    if (distIndex && !fs.existsSync(distIndex)) {
+    const distIndex = webDistIndexPath()
+    if (distIndex === null) {
+      // 锚点解析不了（依赖未装齐或上游改了布局）：不臆测，只留一行便于排查
+      appendLog('提示：无法定位前端包（packages/bundle/web-app/node_modules/@deepseek-ai/dsh-web-frontend），跳过前端构建检查')
+    } else if (!fs.existsSync(distIndex)) {
       appendLog(`警告：DSH 前端资源未构建（缺少 ${distIndex}），内嵌页面会 404；请在 DSH 目录执行 pnpm run build（只重建前端可用 pnpm run build:web）`)
       notify('DSH 前端未构建', '内嵌页面会 404，请在 DSH 目录执行 pnpm run build')
     }
@@ -446,7 +467,7 @@ function runPreflight() {
       appendLog(`警告：无法检测 node 版本（${d.text}），跳过版本检查继续启动`)
     } else {
       const range = readEnginesRange()
-      if (!range.satisfied(d.tuple)) {
+      if (range && !range.satisfied(d.tuple)) {
         return `node 版本不满足 DSH 要求（${range.text}）：当前 ${d.text}，请升级 Node 后重试`
       }
     }
@@ -507,10 +528,7 @@ function startDsh() {
   if (child) return { reason: '已有 DSH 子进程在运行', transient: true }
   if (stopping) return { reason: '停止进行中，请稍候再试', transient: true }
   const preflightReason = runPreflight()
-  if (preflightReason) {
-    appendLog(`启动被预检拒绝: ${preflightReason}`)
-    return { reason: preflightReason, transient: false }
-  }
+  if (preflightReason) return { reason: preflightReason, transient: false }
   appendLog(`启动 DSH: ${cfg.startCmd.join(' ')}  (cwd: ${cfg.dshDir})`)
   childStartAt = Date.now()
   slowBootNotified = false
@@ -687,8 +705,7 @@ function startDsh() {
           // 能从输出里定位原因时直接给出原因，省掉"请查看日志"这一步。
           const why = classifyExit(runLog, code)
           if (why) appendLog(`启动失败原因：${why}`)
-          setState({ value: 'failed', pid: null })
-          notify('DSH 启动失败', why ?? '进程在就绪前退出，请查看日志后重试。')
+          failStart(why ?? '进程在就绪前退出，请查看日志后重试。')
         } else {
           setState({ value: 'stopped', pid: null })
           notify('DSH 已停止', '进程已退出，可点击托盘菜单“重新启动 DSH”。')
@@ -775,6 +792,12 @@ function rearmNoOpenFallback() {
   }
 }
 
+// 拉起失败的统一收尾：置失败态并弹泡（各失败路径共用，避免状态与文案漂移）
+function failStart(reason) {
+  setState({ value: 'failed', pid: null })
+  notify('DSH 启动失败', reason)
+}
+
 // 拉起并把拒绝统一收尾：记日志、翻转为 failed、弹泡给出可行动的原因。
 // 返回 null=已拉起（状态 starting）；返回 { reason, transient }=被拒绝。
 function startDshOrFail() {
@@ -786,13 +809,12 @@ function startDshOrFail() {
   appendLog(`启动 DSH 被拒绝: ${rejection.reason}`)
   if (rejection.transient) {
     // 守卫类拒绝是时序造成的（停止进行中、已有子进程），下一轮探测就能自愈。
-    // 但"starting 且无子进程"是死状态：探测循环没有任何分支能推进它，
-    // 交回 idle 让探测循环重试；其余状态（idle/stopped/failed）保持原值。
-    if (state.value === 'starting' && !child) setState({ value: 'idle', pid: null })
+    // 但"starting 且无子进程"是死状态，交给状态机自己的出口退回 idle；
+    // 其余状态（idle/stopped/failed）保持原值。
+    releaseDeadStartingState()
     return rejection
   }
-  setState({ value: 'failed', pid: null })
-  notify('DSH 启动失败', rejection.reason)
+  failStart(rejection.reason)
   return rejection
 }
 
@@ -804,8 +826,7 @@ async function relaunchDsh() {
   setState({ value: 'starting' })
   if (!(await waitPortFree())) {
     appendLog('端口未释放，已取消自动重启；请稍后重试')
-    setState({ value: 'failed', pid: null })
-    notify('DSH 启动失败', `端口 ${state.port} 迟迟未释放，已取消自动重启；请稍后重试`)
+    failStart(`端口 ${state.port} 迟迟未释放，已取消自动重启；请稍后重试`)
     return '端口未释放'
   }
   return startDshOrFail()
@@ -816,8 +837,13 @@ async function relaunchDsh() {
 function ensureRunning() {
   if (probing || quitting) return
   probing = true
+  // 探测发起时的状态：单次探测最长 5 秒（服务假死时），期间其它路径可能已经推进状态机
+  // （URL 行捕获令牌直接翻 ready、进程退出、停止）。结果到达时若状态已变，这次结果已经
+  // 过时——典型是服务刚由 URL 行宣告就绪，却被早于就绪发起的 down 结果翻成"连接断开"。
+  const stateAtProbe = state.value
   isUp().then(async (status) => {
     if (stopping || quitting) return   // 停止/退出过程中不推进状态机，避免竞态误报
+    if (stateAtProbe !== state.value) return   // 状态已被其它路径改写，本次结果作废
     if (status === 'up') {
       // stopped/failed 是用户主动停止或启动失败的明确状态：端口被残留进程占用
       // 返回 2xx 时不得自动翻转为 ready（与用户停止意图矛盾），交给用户点"重试"。

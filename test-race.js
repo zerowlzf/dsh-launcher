@@ -102,7 +102,7 @@ process.env.corepack_home = 'C:\\corepack'
 process.env.DSH_DESKTOP_SEED = 'C:\\desktop-seed'
 const PATH_BEFORE = process.env.PATH
 const src = fs.readFileSync(mainPath, 'utf8')
-const wrapped = src + '\nmodule.exports.__test = { startDsh, startDshOrFail, stopDsh, relaunchDsh, setCfg, runPreflight, parseVersionTuple, parseEnginesRange, readEnginesRange, isTsxArg, handleInitFailure, CHILD_ENV, classifyExit, writeFileAtomicSync, webDistIndex, getChild: () => child, getState: () => state, setState, getChildStartAt: () => childStartAt }'
+const wrapped = src + '\nmodule.exports.__test = { startDsh, startDshOrFail, stopDsh, relaunchDsh, setCfg, runPreflight, parseVersionTuple, parseEnginesRange, readEnginesRange, isTsxArg, handleInitFailure, CHILD_ENV, classifyExit, writeFileAtomicSync, webDistIndexPath, getChild: () => child, getState: () => state, setState, getChildStartAt: () => childStartAt }'
 const m = new Module(mainPath, module)
 m.filename = mainPath
 m.paths = Module._nodeModulePaths(path.dirname(mainPath))
@@ -333,20 +333,50 @@ T.setCfg({ dshDir: preflightDshRoot })
     fs.existsSync = saveExists
     T.setCfg(cfgBackup)
   }
-  console.log('PASS: runPreflight 分支（tsx/bin.ts 引用门控）符合预期')
+  // 9j：前端静态资源缺失时告警但不拦截（锚点先查 web-app bundle 的 node_modules 链接）
+  const feLink = path.join(preflightDshRoot, 'packages/bundle/web-app/node_modules/@deepseek-ai/dsh-web-frontend')
+  fs.mkdirSync(path.join(feLink, 'dist'), { recursive: true })
+  T.setCfg({ startCmd: ['node', '--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'web', '--no-open'] })
+  let logLen = g.log.length
+  if (T.runPreflight() !== null) throw new Error('FAIL: 缺前端 dist 不应拦截启动（前端可用 Vite 开发）')
+  if (!g.log.slice(logLen).some((l) => l.includes('前端资源未构建'))) throw new Error('FAIL: 缺前端 dist 应告警')
+  fs.writeFileSync(path.join(feLink, 'dist/index.html'), '<html></html>')
+  logLen = g.log.length
+  if (T.runPreflight() !== null) throw new Error('FAIL: 前端 dist 存在时不应告警')
+  if (g.log.slice(logLen).some((l) => l.includes('前端资源未构建'))) throw new Error('FAIL: 前端 dist 存在时不应再告警')
+  // 9k：非 web 命令（如 headless）不检查前端资源
+  fs.rmSync(path.join(feLink, 'dist/index.html'), { force: true })
+  T.setCfg({ startCmd: ['node', '--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'headless', 'x'] })
+  logLen = g.log.length
+  T.runPreflight()
+  if (g.log.slice(logLen).some((l) => l.includes('前端资源未构建'))) throw new Error('FAIL: 非 web 命令不应检查前端资源')
+  // 9l：锚点解析不了（依赖未装齐）时只记一行提示，不误告警
+  fs.rmSync(path.join(preflightDshRoot, 'packages'), { recursive: true, force: true })
+  T.setCfg({ startCmd: ['node', '--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'web', '--no-open'] })
+  logLen = g.log.length
+  T.runPreflight()
+  const anchorLog = g.log.slice(logLen)
+  if (anchorLog.some((l) => l.includes('前端资源未构建'))) throw new Error('FAIL: 锚点解析不了时不应断言前端未构建')
+  if (!anchorLog.some((l) => l.includes('无法定位前端包'))) throw new Error('FAIL: 锚点解析不了时应留一行提示')
+  console.log('PASS: runPreflight 分支（tsx/bin.ts 引用门控 + 前端 dist 告警）符合预期')
 
-  // --- 场景 10：engines 实时读取（DSH package.json 优先，缺失回退内置）---
+  // --- 场景 10：engines 实时读取（可解析则用实时值；读不到回退内置；读到但解析不了则跳过）---
   const fakeDshRoot = path.join(tmp, 'dsh-root-test')
   fs.mkdirSync(fakeDshRoot, { recursive: true })
   fs.writeFileSync(path.join(fakeDshRoot, 'package.json'), JSON.stringify({ engines: { node: '>=20.0.0' } }))
   T.setCfg({ dshDir: fakeDshRoot })
   if (T.readEnginesRange().satisfied([21, 0, 0]) !== true) throw new Error('FAIL: 应读取 DSH 实时 engines（>=20 允许 21）')
   if (T.readEnginesRange().satisfied([19, 0, 0]) !== false) throw new Error('FAIL: 应读取 DSH 实时 engines（>=20 拒绝 19）')
+  // 读到但解析不了（未来可能出现 `>=22.19.0 <26.0.0` 这类区间）：返回 null 跳过检查，
+  // 不得回退旧约束去误拦合格的 node
+  fs.writeFileSync(path.join(fakeDshRoot, 'package.json'), JSON.stringify({ engines: { node: '>=22.19.0 <26.0.0' } }))
+  if (T.readEnginesRange() !== null) throw new Error('FAIL: 无法解析的 engines 应返回 null（跳过版本检查）')
+  if (!g.log.some((l) => l.includes('无法解析 DSH engines.node'))) throw new Error('FAIL: 无法解析的 engines 应记一行警告')
   fs.rmSync(fakeDshRoot, { recursive: true, force: true })
   if (T.readEnginesRange().satisfied([23, 0, 0]) !== false) throw new Error('FAIL: engines 读不到时应回退内置约束（拒绝 23）')
   if (T.readEnginesRange().satisfied([22, 19, 0]) !== true) throw new Error('FAIL: engines 读不到时应回退内置约束（允许 22.19）')
   T.setCfg({ dshDir: preflightDshRoot })   // 恢复，避免悬空指向已删目录
-  console.log('PASS: engines 实时读取 + 内置回退符合预期')
+  console.log('PASS: engines 实时读取 + 内置回退 + 解析失败跳过符合预期')
 
   // --- 场景 11：isTsxArg 门控（正则收紧回归）---
   for (const [arg, want] of [
@@ -357,27 +387,6 @@ T.setCfg({ dshDir: preflightDshRoot })
     if (got !== want) throw new Error(`FAIL: isTsxArg(${JSON.stringify(arg)}) = ${got}, want ${want}`)
   }
   console.log('PASS: isTsxArg 门控符合预期')
-
-  // --- 场景 9j：前端静态资源缺失时告警但不拦截（锚点跟随 web-app bundle 的链接）---
-  const feLink = path.join(preflightDshRoot, 'packages/bundle/web-app/node_modules/@deepseek-ai/dsh-web-frontend')
-  fs.mkdirSync(path.join(feLink, 'dist'), { recursive: true })
-  T.setCfg({ startCmd: ['node', '--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'web', '--no-open'] })
-  const logLen9j = g.log.length
-  if (T.runPreflight() !== null) throw new Error('FAIL: 缺前端 dist 不应拦截启动（前端可用 Vite 开发）')
-  if (!g.log.slice(logLen9j).some((l) => l.includes('前端资源未构建'))) throw new Error('FAIL: 缺前端 dist 应告警')
-  fs.writeFileSync(path.join(feLink, 'dist/index.html'), '<html></html>')
-  const logLen9k = g.log.length
-  if (T.runPreflight() !== null) throw new Error('FAIL: 前端 dist 存在时不应告警')
-  if (g.log.slice(logLen9k).some((l) => l.includes('前端资源未构建'))) throw new Error('FAIL: 前端 dist 存在时不应再告警')
-  // 非 web 命令（如 headless）不检查前端资源
-  fs.rmSync(path.join(feLink, 'dist/index.html'), { force: true })
-  T.setCfg({ startCmd: ['node', '--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'headless', 'x'] })
-  const logLen9l = g.log.length
-  T.runPreflight()
-  if (g.log.slice(logLen9l).some((l) => l.includes('前端资源未构建'))) throw new Error('FAIL: 非 web 命令不应检查前端资源')
-  fs.rmSync(path.join(preflightDshRoot, 'packages'), { recursive: true, force: true })   // 清理夹具
-  T.setCfg({ startCmd: ['node', '--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'web', '--no-open'] })
-  console.log('PASS: 前端 dist 预检符合预期')
 
   // --- 场景 12：子进程环境剥离（NODE_OPTIONS / npm_ / pnpm_ / corepack_，保留 PATH）---
   const childEnv = T.CHILD_ENV
@@ -453,14 +462,29 @@ T.setCfg({ dshDir: preflightDshRoot })
   if (leftovers.length) throw new Error(`FAIL: 原子写残留临时文件 ${JSON.stringify(leftovers)}`)
   console.log('PASS: 原子写配置符合预期')
 
-  // --- 场景 17：停止确认（子进程退出事件到达才宣告停止）---
+  // --- 场景 17：停止后确认子进程退出（正常退出路径不误报"停止未确认"）---
   g.value = 'starting'
   T.startDsh()
   if (!T.getChild()) throw new Error('FAIL: 场景 17 未拉起子进程')
   await T.stopDsh()
   if (T.getChild() !== null) throw new Error('FAIL: 停止后 child 应为 null')
+  if (g.value !== 'stopped') throw new Error(`FAIL: 停止后应为 stopped，实际 ${g.value}`)
   if (g.log.some((l) => l.includes('停止未确认'))) throw new Error('FAIL: 子进程已退出时不应报停止未确认')
-  console.log('PASS: 停止确认符合预期')
+  console.log('PASS: 停止确认（正常退出）符合预期')
+
+  // --- 场景 18：停止未确认（子进程卡住不退出）→ 日志 + 弹泡，状态仍是用户意图的 stopped ---
+  g.value = 'starting'
+  T.startDsh()
+  const c18 = T.getChild()
+  if (!c18) throw new Error('FAIL: 场景 18 未拉起子进程')
+  c18.kill = () => {}     // 模拟 taskkill 无效 / 进程卡住：不发 exit 事件
+  await T.stopDsh()       // 等 STOP_CONFIRM_MS 超时
+  if (g.value !== 'stopped') throw new Error(`FAIL: 停止未确认应保持 stopped（用户意图），实际 ${g.value}`)
+  if (!g.log.some((l) => l.includes('停止未确认'))) throw new Error('FAIL: 停止未确认应记日志')
+  if (T.getChild() !== null) throw new Error('FAIL: 停止未确认后不应继续持有子进程引用')
+  emitExit(c18, 0, null)  // 收尾：进程最终退出
+  g.value = 'idle'
+  console.log('PASS: 停止未确认（卡住不退出）符合预期')
 
   console.log('\n全部通过 ✓')
   process.exit(0)
