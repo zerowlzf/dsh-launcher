@@ -10,6 +10,10 @@ const { EventEmitter } = require('events')
 
 const mainPath = process.env.RACE_MAIN || path.join(__dirname, 'main.js')
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'launcher-race-'))
+// 每轮跑完清掉桩目录：否则每次 npm test 都在 %TEMP% 留下一个夹具目录
+function cleanup() {
+  try { fs.rmSync(tmp, { recursive: true, force: true }) } catch { /* 清理失败不影响判定 */ }
+}
 
 const spawned = []
 // 初始化失败收尾 / 子进程环境剥离的观测点
@@ -487,5 +491,6 @@ T.setCfg({ dshDir: preflightDshRoot })
   console.log('PASS: 停止未确认（卡住不退出）符合预期')
 
   console.log('\n全部通过 ✓')
+  cleanup()
   process.exit(0)
-})().catch((e) => { console.error(e); process.exit(1) })
+})().catch((e) => { cleanup(); console.error(e); process.exit(1) })
