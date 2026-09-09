@@ -12,7 +12,7 @@
 
 ## 与官方桌面端的关系
 
-上游 DSH 已出现官方 Electron 桌面端（`apps/desktop` 与 `apps/desktop-host`，2026-08-28 起出现、随 dsh 0.1.3-alpha.2 进入发布）：无监听端口（`dsh-app://` 协议 + 字节管道传输）、独占 `$DSH_HOME/profiles/desktop`、与 dsh 同版本发布，且 CLI 已禁止引导该 profile（`dsh --profile desktop` 报错）。启动器与官方桌面端互不冲突——启动器走 web 通道（3080 端口 + 源码模式），桌面端走自有通道与独立 profile。
+上游 DSH 已出现官方 Electron 桌面端（`apps/desktop` 2026-08-28 起在 master 出现、`apps/desktop-host` 2026-09-04 出现，随 dsh 0.1.5-alpha.1 首次进入发布）：无监听端口（`dsh-app://` 协议 + 字节管道传输）、独占 `$DSH_HOME/profiles/desktop`、与 dsh 同版本发布，且 CLI 已禁止引导该 profile（`dsh --profile desktop` 报错）。启动器与官方桌面端互不冲突——启动器走 web 通道（3080 端口 + 源码模式），桌面端走自有通道与独立 profile。
 
 按上方「可退役」设计原则，官方桌面端的出现不触发退役——退役只在用户显式决定时生效。本启动器继续使用与维护：官方桌面端面向打包分发与版本一体化场景，启动器覆盖源码模式跟随、托盘驻留与自动重启的既有工作流，两者互不替代。
 
