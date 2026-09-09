@@ -492,9 +492,11 @@ function classifyExit(runLog, code) {
 function exitsWithin(proc, timeoutMs) {
   if (!proc || proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve(true)
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeoutMs)
+    const onExit = () => { clearTimeout(timer); resolve(true) }
+    // 超时后摘掉监听：否则反复"停止未确认"会在同一个进程对象上堆积 exit 监听
+    const timer = setTimeout(() => { proc.removeListener('exit', onExit); resolve(false) }, timeoutMs)
     if (timer.unref) timer.unref()
-    proc.once('exit', () => { clearTimeout(timer); resolve(true) })
+    proc.once('exit', onExit)
   })
 }
 
