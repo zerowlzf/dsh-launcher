@@ -472,17 +472,18 @@ const CHILD_ENV = Object.fromEntries(Object.entries(process.env).filter(([name])
 // 而不是让用户自己去翻日志。上游契约：profile-boot 对 SIGTERM 退出 0、SIGINT 退出 130；
 // app-boot 打印 `dsh: fatal load failure:` / `dsh: host preparation failed:` /
 // `dsh: plugin tree failed to load:`；commander 用法错误打印 `error: `。
+// 这两类都走 stderr，本启动器在缓冲时给 stderr 行加了 `ERR ` 前缀，故前缀可选。
 // 返回 null 表示无匹配，调用方使用通用文案。
 function classifyExit(runLog, code) {
   if (code === 130) return 'DSH 被中断（SIGINT）'
-  const fatal = runLog.match(/^dsh: (?:fatal load failure|host preparation failed|plugin tree failed to load):.*$/m)
-  if (fatal) return fatal[0].trim()
+  const fatal = runLog.match(/^(?:ERR )?dsh: (?:fatal load failure|host preparation failed|plugin tree failed to load):.*$/m)
+  if (fatal) return fatal[0].replace(/^ERR /, '').trim()
   // DSH 更新后未重装依赖（如工作区改名）会以模块解析失败告终
   if (/ERR_MODULE_NOT_FOUND|Cannot find (?:module|package)/i.test(runLog)) {
     return '依赖未安装或与当前源码不匹配（模块解析失败）：请在 DSH 目录执行 pnpm install 后重试'
   }
-  const usage = runLog.match(/^error: .*$/m)
-  if (usage) return usage[0].trim()
+  const usage = runLog.match(/^(?:ERR )?error: .*$/m)
+  if (usage) return usage[0].replace(/^ERR /, '').trim()
   return null
 }
 

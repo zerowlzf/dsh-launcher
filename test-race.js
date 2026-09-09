@@ -416,9 +416,13 @@ T.setCfg({ dshDir: preflightDshRoot })
   // --- 场景 15：退出原因分类（上游稳定的 stderr 前缀与退出码）---
   for (const [log, code, want] of [
     ['dsh: fatal load failure: Error: boom', 1, 'fatal load failure'],
+    // 上游 fatal/用法错误都走 stderr，本启动器会给 stderr 行加 `ERR ` 前缀
+    ['ERR dsh: fatal load failure: Error: boom', 1, 'fatal load failure'],
     ['dsh: plugin tree failed to load: web-app: boom', 1, 'plugin tree failed to load'],
+    ['ERR dsh: host preparation failed: x', 1, 'host preparation failed'],
     ['Error [ERR_MODULE_NOT_FOUND]: Cannot find package "@deepseek-ai/dsh-app-boot"', 1, 'pnpm install'],
     ["error: unknown option '--nope'", 1, 'unknown option'],
+    ["ERR error: unknown option '--nope'", 1, 'unknown option'],
     ['only noise', 1, null],
     ['whatever', 130, 'SIGINT'],
   ]) {
@@ -426,12 +430,13 @@ T.setCfg({ dshDir: preflightDshRoot })
     if (want === null ? got !== null : !String(got).includes(want)) {
       throw new Error(`FAIL: classifyExit(${JSON.stringify(log)}, ${code}) = ${JSON.stringify(got)}，应含 ${want}`)
     }
+    if (got && got.startsWith('ERR ')) throw new Error(`FAIL: 分类结果不应带缓冲前缀，实际 ${JSON.stringify(got)}`)
   }
   // 分类结果要落到日志与状态：启动期致命错误不再只说"请查看日志"
   g.value = 'starting'
   T.startDsh()
   const c15 = T.getChild()
-  c15.stdout.emit('data', 'dsh: plugin tree failed to load: web-app: boom\n')
+  c15.stderr.emit('data', 'dsh: plugin tree failed to load: web-app: boom\n')
   emitExit(c15, 1, null)
   if (g.value !== 'failed') throw new Error(`FAIL: 致命加载失败应置 failed，实际 ${g.value}`)
   if (!g.log.some((l) => l.includes('启动失败原因：dsh: plugin tree failed to load'))) {
