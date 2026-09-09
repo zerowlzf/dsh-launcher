@@ -1,6 +1,6 @@
 // DSH 桌面启动器 — main process
 // Win11 风格炭黑窗口 · 托盘驻留 · 自动探测/启动/停止 DSH（源码版）
-const { app, BrowserWindow, Tray, Menu, shell, nativeImage, ipcMain, screen } = require('electron')
+const { app, BrowserWindow, Tray, Menu, shell, nativeImage, ipcMain, screen, dialog } = require('electron')
 const { spawn, execFile, spawnSync } = require('child_process')
 const fs = require('fs')
 const path = require('path')
@@ -400,14 +400,24 @@ function runPreflight() {
 // 测试钩子：test-race.js 注入临时配置，驱动 runPreflight 的各条分支（真实启动路径不使用）
 function setCfg(patch) { cfg = { ...cfg, ...patch } }
 
+// DSH 子进程继承的环境变量：剥离 shell/调试器污染项（对齐官方桌面端
+// apps/desktop/src/host-process.ts 的做法）。用户从设置了 NODE_OPTIONS 等变量的终端
+// 启动本启动器时，原样继承会导致 DSH 子进程启动失败或行为异常。
+// 只做黑名单剥离：PATH 等正常变量保持原样，node 仍能从 PATH 解析。
+const CHILD_ENV = Object.fromEntries(Object.entries(process.env).filter(([name]) => (
+  name !== 'NODE_OPTIONS' && !/^(?:npm|pnpm|corepack)_/i.test(name)
+)))
+
 function startDsh() {
-  // 返回 null=已启动；返回字符串=被守卫拒绝的原因（调用方负责回滚状态）
-  if (child) return '已有 DSH 子进程在运行'
-  if (stopping) return '停止进行中，请稍候再试'
+  // 返回 null=已启动；返回 { reason, transient }=被守卫/预检拒绝。
+  // transient=true：竞态或时序造成的拒绝，下一轮探测可自愈，调用方不得翻 failed。
+  // transient=false：预检类拒绝（node 版本/依赖/入口），重试不会好，必须让用户处理。
+  if (child) return { reason: '已有 DSH 子进程在运行', transient: true }
+  if (stopping) return { reason: '停止进行中，请稍候再试', transient: true }
   const preflightReason = runPreflight()
   if (preflightReason) {
     appendLog(`启动被预检拒绝: ${preflightReason}`)
-    return preflightReason
+    return { reason: preflightReason, transient: false }
   }
   appendLog(`启动 DSH: ${cfg.startCmd.join(' ')}  (cwd: ${cfg.dshDir})`)
   childStartAt = Date.now()
@@ -509,6 +519,7 @@ function startDsh() {
     // （停止→立即重启的竞态），只有"仍是当前进程"的退出才允许改写全局状态。
     const c = spawn(cfg.startCmd[0], cfg.startCmd.slice(1), {
       cwd: cfg.dshDir,
+      env: CHILD_ENV,
       windowsHide: true,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -651,17 +662,24 @@ function rearmNoOpenFallback() {
 }
 
 // 拉起并把拒绝统一收尾：记日志、翻转为 failed、弹泡给出可行动的原因。
-// 返回 null=已拉起（状态 starting）；返回字符串=被拒绝的原因。
+// 返回 null=已拉起（状态 starting）；返回 { reason, transient }=被拒绝。
 function startDshOrFail() {
-  const reason = startDsh()
-  if (reason) {
-    appendLog(`启动 DSH 被拒绝: ${reason}`)
-    setState({ value: 'failed', pid: null })
-    notify('DSH 启动失败', reason)
-    return reason
+  const rejection = startDsh()
+  if (!rejection) {
+    setState({ value: 'starting' })
+    return null
   }
-  setState({ value: 'starting' })
-  return null
+  appendLog(`启动 DSH 被拒绝: ${rejection.reason}`)
+  if (rejection.transient) {
+    // 守卫类拒绝是时序造成的（停止进行中、已有子进程），下一轮探测就能自愈。
+    // 但"starting 且无子进程"是死状态：探测循环没有任何分支能推进它，
+    // 交回 idle 让探测循环重试；其余状态（idle/stopped/failed）保持原值。
+    if (state.value === 'starting' && !child) setState({ value: 'idle', pid: null })
+    return rejection
+  }
+  setState({ value: 'failed', pid: null })
+  notify('DSH 启动失败', rejection.reason)
+  return rejection
 }
 
 // 停止 → 等端口释放 → 重新拉起的共享流程（托盘"重新启动 DSH"、重试超时强杀、
@@ -738,8 +756,9 @@ function ensureRunning() {
     }
     if (state.value === 'degraded') return
     if (state.value === 'idle') {
-      // 预检拒绝时 startDshOrFail 会置 failed 并弹泡：
-      // 否则 starting 且无子进程、childStartAt=0，探测循环无分支命中，UI 永远停在"启动中"
+      // 先拉起、成功才置 starting：否则 starting 且无子进程、childStartAt=0，
+      // 探测循环无分支命中，UI 永远停在"启动中"。
+      // 预检类拒绝由 startDshOrFail 置 failed 并弹泡；守卫类拒绝保持 idle，下轮探测重试。
       startDshOrFail()
       return
     }
@@ -933,16 +952,10 @@ ipcMain.handle('launcher:retry', async () => {
   }
   if (!child) {
     rearmNoOpenFallback()
-    // 拒绝收尾（failed + 弹泡）与 startDshOrFail 一致，但保留本分支特有的
-    // 回滚语义：守卫拒绝（停止进行中等极窄窗口）回滚 starting，避免卡死等待
-    const reason = startDsh()
-    if (reason) {
-      appendLog(`启动 DSH 被拒绝: ${reason}`)
-      setState({ value: state.value === 'starting' ? 'failed' : state.value })
-      notify('DSH 启动失败', reason)
-    } else {
-      setState({ value: 'starting' })
-    }
+    // 与其它拉起路径共用收尾：预检拒绝已置 failed + 弹泡，守卫拒绝保持可自愈状态。
+    // 本分支是用户点击触发的：守卫拒绝（停止恰好进行中）要明确反馈，否则点了像没反应。
+    const rejection = startDshOrFail()
+    if (rejection && rejection.transient) notify('DSH 暂未启动', rejection.reason)
     return
   }
   // 子进程仍在但服务未就绪：DSH 冷启动可能长达 2 分钟以上，
@@ -955,10 +968,6 @@ ipcMain.handle('launcher:retry', async () => {
     appendLog(`DSH 仍在启动中（已 ${Math.round(elapsedMs / 1000)} 秒），继续等待…`)
     setState({ value: 'starting' })
   }
-})
-ipcMain.handle('launcher:openExternal', (_e, url) => {
-  // webview 内 window.open 的外部链接：仅放行 http/https，交给系统浏览器
-  if (typeof url === 'string' && /^https?:\/\//i.test(url)) shell.openExternal(url)
 })
 ipcMain.handle('launcher:stopDsh', () => stopDsh())
 ipcMain.handle('launcher:copyLog', () => {
@@ -993,6 +1002,16 @@ const startHidden = process.argv.includes('--hidden')
 let trayNotified = false
 let winShownOnce = false
 
+// 启动链路（窗口/托盘/session 配置）异常不能静默沉没：没有收尾时 Promise 拒绝只在
+// 不可见的 stderr 留一行，用户面对无窗口、无托盘、无日志的"假死"。
+// 对齐官方桌面端（apps/desktop/src/main.ts）：写日志 + 错误弹窗 + 非零退出码。
+function handleInitFailure(error) {
+  const msg = error instanceof Error ? `${error.message}\n${error.stack ?? ''}` : String(error)
+  appendLog(`启动器初始化失败: ${msg}`)
+  try { dialog.showErrorBox('DSH 启动器初始化失败', msg.slice(0, 1000)) } catch { /* 无桌面会话时弹窗不可用，日志已留痕 */ }
+  app.exit(1)
+}
+
 if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
@@ -1013,7 +1032,7 @@ if (!app.requestSingleInstanceLock()) {
     setState({ value: 'idle', log: [] })
     ensureRunning()
     probeTimer = setInterval(ensureRunning, PROBE_INTERVAL_MS)
-  })
+  }).catch(handleInitFailure)
 }
 
 app.on('window-all-closed', () => { /* 托盘驻留，不退出 */ })
