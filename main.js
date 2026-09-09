@@ -1012,6 +1012,9 @@ function showWindow() {
   if (win.isMinimized()) win.restore()
   win.show()
   win.focus()
+  // Windows 前台锁：只有 show()+focus() 时，窗口可能只闪到任务栏而不置顶，
+  // 表现为"点两次托盘图标才打开"。moveTop 明确把窗口提到 Z 序顶部（不改 always-on-top）。
+  win.moveTop()
 }
 
 // ---------------------------------------------------------------- tray
