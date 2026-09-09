@@ -21,6 +21,20 @@
 - 体验官方桌面端（与启动器无关，仅备忘）：仓库根执行 `pnpm run dev:desktop`（构建后可直接 `pnpm run start:desktop`）；正式 Windows 安装包走 `pnpm run package:desktop:win:x64`（发布级需 EV 签名基础设施，`:dir` 变体产出免安装目录）
 - 若用户显式决定退役：直接删除本目录即可，DSH 本体与官方桌面端不受影响（配置与日志见「卸载」）
 
+## 依赖的上游契约
+
+启动器只依赖下列上游契约，不读 DSH 内部 API。DSH 更新后按本表逐项核对（`核对基线：dsh 0.1.5-alpha.1，HEAD 05b4b0eaac`）。
+
+| 契约 | 上游位置 | 启动器如何依赖 |
+|---|---|---|
+| `dsh web` 是 `--profile web` 的硬编码别名；web 参数族含 `--no-open`、`--host`、`--port`、`--trusted-host` | `apps/cli/src/args.ts`、`packages/bundle/web-app/src/startup.ts` | `startCmd` 启动参数；`--no-open` 缺失时自动补，上游不认时自动回退 |
+| 启动令牌 URL 行 `dsh web: <url>?token=...`（`printUrl` 默认 true；LAN 地址以 `(LAN: ...)` 追加在同一行） | `packages/bundle/web-app/src/index.ts` | 从 stdout 捕获令牌，拼认证 URL 加载内嵌页面 |
+| 探测语义：2xx/3xx = 服务在；401 = 需令牌；其余 = 未就绪 | `packages/client/connection/src/browser-auth.ts` | 探测状态机（ready / 需认证 / degraded） |
+| 默认 host `127.0.0.1`、默认 port `3080` | `packages/bundle/web-app/cordis.patch.yml` | 探测与内嵌 URL 默认值；端口以 URL 行自报值为准（端口漂移跟随） |
+| 源码启动须走 tsx 的 ESM 钩子（`node --import tsx/esm apps/cli/src/bin.ts`），仓库依赖中需有 `tsx`、入口文件需存在 | 根 `package.json`、`apps/cli/src/bin.ts`、`.agents/notes/implemented/architecture/2026-07-29-dsh-source-launch-tsx-esm.md` | 启动预检（缺 `node_modules/tsx` 提示 `pnpm install`、缺入口提示 `dshDir` 配错） |
+| 根 `package.json` 的 `engines.node` 是源码运行的 node 版本要求 | 根 `package.json` | 启动预检实时读取（读不到回退 `^22.19.0 \|\| >=24.0.0`），每次拉起现查 |
+| `dsh --profile desktop` 由 CLI 拒绝（官方桌面端独占该 profile） | `apps/cli/src/args.ts`（`rejectElectronProfile`） | 保证两条通道互不干扰，启动器不会误接管桌面端 |
+
 ## 使用
 
 - **双击 `Start-Launcher.vbs`** 启动（首次自动安装依赖，之后秒开）。
