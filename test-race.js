@@ -12,6 +12,9 @@ const mainPath = process.env.RACE_MAIN || path.join(__dirname, 'main.js')
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'launcher-race-'))
 
 const spawned = []
+// 初始化失败收尾 / 子进程环境剥离的观测点
+const dialogCalls = []
+const exitCalls = []
 // 预检的 node --version 输出可被场景调节（fakeNodeVersion），默认满足回退 engines
 let fakeNodeVersion = 'v24.15.0'
 function fakeSpawn(cmd, args, opts) {
@@ -37,7 +40,9 @@ const stubs = {
       requestSingleInstanceLock: () => true,
       getLoginItemSettings: () => ({ openAtLogin: false }),
       setLoginItemSettings() {},
+      exit: (code) => { exitCalls.push(code) },
     },
+    dialog: { showErrorBox: (title, content) => { dialogCalls.push([title, content]) } },
     BrowserWindow: class {
       constructor() { this.webContents = { send() {}, on() {}, getURL: () => '', setWindowOpenHandler() {}, getTitle: () => '' } }
       loadFile() { return Promise.resolve() }
@@ -77,8 +82,14 @@ Module._load = function (request, parent, isMain) {
 }
 
 // 加载 main.js 并把内部函数暴露出来供测试驱动
+// CHILD_ENV 在模块加载时快照 process.env：先注入污染变量，再编译，验证剥离名单。
+process.env.NODE_OPTIONS = '--inspect=127.0.0.1:9229'
+process.env.npm_config_registry = 'https://mirror.invalid/'
+process.env.PNPM_HOME = 'C:\\pnpm-home'
+process.env.corepack_home = 'C:\\corepack'
+const PATH_BEFORE = process.env.PATH
 const src = fs.readFileSync(mainPath, 'utf8')
-const wrapped = src + '\nmodule.exports.__test = { startDsh, stopDsh, relaunchDsh, setCfg, runPreflight, parseVersionTuple, parseEnginesRange, readEnginesRange, isTsxArg, getChild: () => child, getState: () => state, setState, getChildStartAt: () => childStartAt }'
+const wrapped = src + '\nmodule.exports.__test = { startDsh, startDshOrFail, stopDsh, relaunchDsh, setCfg, runPreflight, parseVersionTuple, parseEnginesRange, readEnginesRange, isTsxArg, handleInitFailure, CHILD_ENV, getChild: () => child, getState: () => state, setState, getChildStartAt: () => childStartAt }'
 const m = new Module(mainPath, module)
 m.filename = mainPath
 m.paths = Module._nodeModulePaths(path.dirname(mainPath))
@@ -170,8 +181,9 @@ T.setCfg({ dshDir: preflightDshRoot })
   // 真实预检走 tsx 依赖分支拒绝：临时移除夹具的 node_modules
   g.value = 'starting'
   fs.rmSync(path.join(preflightDshRoot, 'node_modules'), { recursive: true, force: true })
-  const reason6 = T.startDsh()
-  if (!reason6 || !reason6.includes('pnpm install')) throw new Error(`FAIL: 预检拒绝应返回依赖原因，实际 ${JSON.stringify(reason6)}`)
+  const rejection6 = T.startDsh()
+  if (!rejection6 || !rejection6.reason.includes('pnpm install')) throw new Error(`FAIL: 预检拒绝应返回依赖原因，实际 ${JSON.stringify(rejection6)}`)
+  if (rejection6.transient !== false) throw new Error('FAIL: 预检拒绝应标记 transient=false（重试不会自愈）')
   if (T.getChild() !== null) throw new Error('FAIL: 预检拒绝后不应拉起子进程')
   if (g.value !== 'starting') throw new Error(`FAIL: startDsh 只返回原因不改状态（收尾由调用方负责），实际 ${g.value}`)
   console.log('PASS: 预检拒绝不拉起子进程并返回原因')
@@ -198,6 +210,19 @@ T.setCfg({ dshDir: preflightDshRoot })
     throw new Error(`FAIL: 兜底递归应持久化 noOpen:false，实际 ${JSON.stringify(persisted)}`)
   }
   console.log('PASS: --no-open 兜底递归重新拉起并持久化回退')
+
+  // --- 场景 6d：守卫类拒绝标记 transient，startDshOrFail 保持状态等重试 ---
+  // 复用 6c 留下的存活子进程：child 非空，任何拉起都会被守卫拒绝
+  g.value = 'idle'
+  const rejection6d = T.startDsh()
+  if (!rejection6d || rejection6d.transient !== true) throw new Error(`FAIL: 已有子进程应标记 transient=true，实际 ${JSON.stringify(rejection6d)}`)
+  const ret6d = T.startDshOrFail()
+  if (g.value !== 'idle') throw new Error(`FAIL: 守卫类拒绝应保持 idle 等下一轮探测，实际 ${g.value}`)
+  if (!ret6d || ret6d.reason !== rejection6d.reason) throw new Error('FAIL: startDshOrFail 应把拒绝原因原样返回')
+  if (ret6d.transient !== true) throw new Error('FAIL: startDshOrFail 应把 transient 标记原样返回')
+  T.getChild().emit('exit', 0, null)     // 收尾：释放子进程，避免影响后续场景
+  if (T.getChild() !== null) throw new Error('FAIL: 收尾后 child 应为 null')
+  console.log('PASS: 守卫类拒绝保持状态等重试，不翻 failed')
 
   // --- 场景 7：版本元组解析；不可解析（预发布后缀等）返回 null 走 fail-open ---
   for (const [v, want] of [
@@ -319,6 +344,29 @@ T.setCfg({ dshDir: preflightDshRoot })
     if (got !== want) throw new Error(`FAIL: isTsxArg(${JSON.stringify(arg)}) = ${got}, want ${want}`)
   }
   console.log('PASS: isTsxArg 门控符合预期')
+
+  // --- 场景 12：子进程环境剥离（NODE_OPTIONS / npm_ / pnpm_ / corepack_，保留 PATH）---
+  const childEnv = T.CHILD_ENV
+  for (const name of ['NODE_OPTIONS', 'npm_config_registry', 'PNPM_HOME', 'corepack_home']) {
+    if (childEnv[name] !== undefined) throw new Error(`FAIL: ${name} 应被剥离，实际 ${JSON.stringify(childEnv[name])}`)
+  }
+  // Windows 上 PATH 的实际键名是 `Path`：按大小写不敏感查找，避免误判为"被剥离"
+  const pathKey = Object.keys(childEnv).find((k) => k.toUpperCase() === 'PATH')
+  if (!pathKey || childEnv[pathKey] !== PATH_BEFORE) throw new Error(`FAIL: PATH 应原样继承（node 仍须能从 PATH 解析），键=${pathKey}`)
+  console.log('PASS: 子进程环境剥离符合预期')
+
+  // --- 场景 13：初始化失败不静默（日志 + 弹窗 + 非零退出码）---
+  T.handleInitFailure(new Error('session 配置损坏'))
+  const lastDialog = dialogCalls.at(-1)
+  if (!lastDialog || !lastDialog[0].includes('初始化失败') || !lastDialog[1].includes('session 配置损坏')) {
+    throw new Error(`FAIL: 初始化失败应弹窗报错，实际 ${JSON.stringify(lastDialog)}`)
+  }
+  if (exitCalls.at(-1) !== 1) throw new Error(`FAIL: 初始化失败应以退出码 1 退出，实际 ${JSON.stringify(exitCalls)}`)
+  if (!g.log.some((l) => l.includes('启动器初始化失败'))) throw new Error('FAIL: 初始化失败应写日志')
+  T.handleInitFailure('裸字符串异常')   // 非 Error 输入同样要有弹窗与退出码
+  if (!dialogCalls.at(-1)[1].includes('裸字符串异常')) throw new Error('FAIL: 非 Error 输入应转成字符串进弹窗')
+  if (exitCalls.at(-1) !== 1) throw new Error('FAIL: 非 Error 输入同样应以退出码 1 退出')
+  console.log('PASS: 初始化失败走日志 + 弹窗 + 退出码 1')
 
   console.log('\n全部通过 ✓')
   process.exit(0)
