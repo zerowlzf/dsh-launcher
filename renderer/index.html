@@ -22,7 +22,7 @@
   </header>
 
   <main>
-    <!-- allowpopups 必须保留（实测结论，勿删）：Electron 43 下 webview 不带该属性时，
+    <!-- allowpopups 必须保留（本机 Electron 43 实测，勿删）：webview 不带该属性时，
          主进程的 setWindowOpenHandler 根本不会触发 —— DSH GUI 里 target=_blank /
          window.open 的外部链接会静默失效。带该属性时 handler 正常触发，由主进程
          deny-all 并交给系统浏览器；弹窗安全靠主进程策略兜底，不靠这个属性。 -->
