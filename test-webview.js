@@ -3,9 +3,12 @@
 // 旧代码此时给 <webview>.src 赋值，元素尚未升级（custom element 未定义），赋值被静默丢弃，
 // 访客永远停在 about:blank —— 窗口标题栏显示"运行中"而内容区全黑；且旧重试条件
 // （lastSetUrl !== currentUrl）永不成立，无法自愈。
-// 本测试用桩 preload 立刻回一个 ready 状态，验证 webview 最终真的加载出内容。
-// 确定性：桩 preload 的 getState() 在渲染脚本执行的同一微任务里就 resolve，ready 必然
-// 早于元素升级到达，因此旧实现是 100% 失败（实测 5/5、8/8 红），不是偶发采样。
+// 本测试用桩 preload 立刻回一个 ready 状态，分两阶段验证：
+// 阶段一（快加载）：验证 webview 最终真的加载出内容。原实现是否踩中丢失赋值取决于
+//   元素升级时机，实测多为红（5/5、8/8）但不是每次必红，因此它是高频复现而非确定性断言。
+// 阶段二（慢加载 + 200ms 状态推送）：确定性锁死"不得反复重设 src 打断在途加载"。
+//   曾出现的回归是同步路径按"是否已开始加载"重发，服务端 3 秒响应时被重发 149 次、
+//   页面永远加载不完；本阶段断言最终加载成功且服务端只收到 1 次请求。
 // 运行：node test-webview.js   （需要 devDependency electron；窗口全程隐藏）
 const fs = require('fs')
 const os = require('os')
@@ -44,18 +47,23 @@ function freePort() {
   })
 }
 
-function startStubServer(port) {
+// 桩服务：可配置响应延迟，并统计收到的请求数（用来证明"在途加载没有被反复打断"）
+function startStubServer(port, delayMs = 0) {
+  let count = 0
   return new Promise((resolve) => {
     const srv = http.createServer((req, res) => {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-      res.end(`<!doctype html><meta charset="utf-8"><title>stub</title><body>${BODY_MARKER}</body>`)
+      count++
+      const body = `<!doctype html><meta charset="utf-8"><title>stub</title><body>${BODY_MARKER}</body>`
+      if (delayMs > 0) setTimeout(() => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(body) }, delayMs)
+      else { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(body) }
     })
-    srv.listen(port, '127.0.0.1', () => resolve(srv))
+    srv.listen(port, '127.0.0.1', () => resolve({ srv, requests: () => count }))
   })
 }
 
-// 被测渲染层的宿主：真实 renderer/ + 桩 preload（状态立刻 ready）
-function buildHarness(rootDir, pageUrl) {
+// 被测渲染层的宿主：真实 renderer/ + 桩 preload（状态立刻 ready）。
+// pushEveryMs > 0 时周期性推送状态，模拟主进程"每次 appendLog 都 push"的日志流量。
+function buildHarness(rootDir, pageUrl, pushEveryMs = 0) {
   const appDir = path.join(rootDir, 'app')
   fs.mkdirSync(path.join(appDir, 'renderer'), { recursive: true })
   fs.mkdirSync(path.join(appDir, 'assets'), { recursive: true })
@@ -63,11 +71,14 @@ function buildHarness(rootDir, pageUrl) {
     fs.copyFileSync(path.join(__dirname, rel), path.join(appDir, rel))
   }
   fs.copyFileSync(path.join(__dirname, 'assets', 'whale-white.svg'), path.join(appDir, 'assets', 'whale-white.svg'))
+  const onStatus = pushEveryMs > 0
+    ? `(cb) => { const t = setInterval(() => cb(STATE), ${pushEveryMs}); return () => clearInterval(t) },`
+    : '() => () => {},'
   fs.writeFileSync(path.join(appDir, 'preload.js'), `const { contextBridge } = require('electron')
 const STATE = ${JSON.stringify({ state: 'ready', port: 0, url: pageUrl, pid: null, log: [] })}
 contextBridge.exposeInMainWorld('launcher', {
   getState: () => Promise.resolve(STATE),
-  onStatus: () => () => {},
+  onStatus: ${onStatus}
   retry: () => Promise.resolve(),
   stopDsh: () => Promise.resolve(),
   openBrowser: () => Promise.resolve(),
@@ -113,12 +124,12 @@ function redactUrl(url) {
   return String(url).replace(/([?&]token=)[^&\s]+/gi, '$1***')
 }
 
-async function runOnce(appDir, pageUrl, index) {
+async function runOnce(appDir, pageUrl, index, waitMs = 12000) {
   const stubPort = new URL(pageUrl).port
   const cdpPort = await freePort()
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), `launcher-webview-ud-${index}-`))
   // 捕获 Electron 输出：启动失败（缺 DLL、参数错误等）时才有线索，
-  // 否则只会看到"12 秒内没加载出内容"
+  // 否则只会看到"webview 未加载出内容"
   let electronOutput = ''
   const child = spawn(ELECTRON_EXE, [
     appDir, '--hidden', `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${userData}`,
@@ -127,20 +138,20 @@ async function runOnce(appDir, pageUrl, index) {
   child.stderr.on('data', (d) => { electronOutput += String(d) })
 
   try {
-    for (let i = 0; i < 24; i++) {
+    for (let i = 0; i < Math.ceil(waitMs / 500); i++) {
       const list = await targets(cdpPort)
       const guest = list.find((t) => t.url.includes(`127.0.0.1:${stubPort}`))
       if (guest) {
         const text = await evaluate(guest.webSocketDebuggerUrl, 'document.body ? document.body.innerText : ""')
         if (typeof text === 'string' && text.includes(BODY_MARKER)) return { ok: true }
-        // 已导航但内容未就绪：继续等（最多 24 轮）
+        // 已导航但内容未就绪：继续等
       }
       await sleep(500)
     }
     const list = await targets(cdpPort)
     const urls = list.map((t) => redactUrl(t.url)).join(' | ') || '(无 target)'
     const tail = electronOutput.trim().split('\n').slice(-4).join(' / ')
-    return { ok: false, detail: `12 秒内 webview 未加载出内容（targets: ${urls}）${tail ? ` | electron: ${tail}` : ''}` }
+    return { ok: false, detail: `${Math.round(waitMs / 1000)} 秒内 webview 未加载出内容（targets: ${urls}）${tail ? ` | electron: ${tail}` : ''}` }
   } finally {
     child.kill()
     // 等进程真正退出再删目录：Windows 上进程仍持有 userData 里的文件时 rmSync 会 EPERM
@@ -163,25 +174,43 @@ async function runOnce(appDir, pageUrl, index) {
   let failed = 0
   try {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'launcher-webview-test-'))
-    const stubPort = await freePort()
-    const pageUrl = `http://127.0.0.1:${stubPort}/?token=test-token`
-    server = await startStubServer(stubPort)
-    const appDir = buildHarness(root, pageUrl)
 
+    // 阶段一：状态早于元素升级就绪（原始事故）——桩服务即时响应
+    const fastPort = await freePort()
+    const fastUrl = `http://127.0.0.1:${fastPort}/?token=test-token`
+    server = await startStubServer(fastPort)
+    const fastApp = buildHarness(root, fastUrl)
     for (let i = 0; i < ITERATIONS; i++) {
-      const r = await runOnce(appDir, pageUrl, i)
+      const r = await runOnce(fastApp, fastUrl, i)
       if (r.ok) console.log(`PASS: webview 第 ${i + 1} 次加载成功（状态早期就绪也不丢 src）`)
       else { failed++; console.log(`FAIL: 第 ${i + 1} 次 ${r.detail}`) }
     }
+    server.srv.close()
+
+    // 阶段二：首次加载较慢 + 高频状态推送（模拟每次 appendLog 都 push）时，
+    // 在途加载不得被反复打断——旧实现实测服务端收到 119 次请求且页面永远加载不完。
+    const slowPort = await freePort()
+    const slowUrl = `http://127.0.0.1:${slowPort}/?token=test-token`
+    const slow = await startStubServer(slowPort, 3000)
+    const slowApp = buildHarness(root, slowUrl, 200)
+    const slowRun = await runOnce(slowApp, slowUrl, 'slow', 25000)
+    const slowRequests = slow.requests()
+    if (slowRun.ok && slowRequests === 1) {
+      console.log(`PASS: 慢加载（3s 响应 + 200ms 状态推送）未被反复打断（服务端请求数 ${slowRequests}）`)
+    } else {
+      failed++
+      console.log(`FAIL: 慢加载用例 ${slowRun.ok ? '已加载' : slowRun.detail}，但服务端收到 ${slowRequests} 次请求（应为 1）`)
+    }
+    slow.srv.close()
   } finally {
-    if (server) server.close()
+    if (server) server.srv.close()
     if (root) { try { fs.rmSync(root, { recursive: true, force: true }) } catch { /* 清理失败不影响判定 */ } }
   }
 
   if (failed > 0) {
-    console.error(`\n${failed}/${ITERATIONS} 次失败：webview 竞态回归`)
+    console.error(`\n${failed} 项失败：webview 竞态/重入回归`)
     process.exit(1)
   }
-  console.log(`\n全部通过 ✓（${ITERATIONS} 次）`)
+  console.log(`\n全部通过 ✓（快加载 ${ITERATIONS} 次 + 慢加载 1 次）`)
   process.exit(0)
 })().catch((e) => { console.error(e); process.exit(1) })

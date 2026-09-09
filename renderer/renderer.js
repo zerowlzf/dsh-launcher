@@ -132,15 +132,17 @@ function applyStatus(s) {
 // 只能跟踪自己最后一次设置的值。
 let lastSetUrl = ''
 
-// 访客是否已开始加载：元素未升级（getURL 不存在）或停在 about:blank 都算没开始。
+// 访客是否已开始加载：主框架正在加载、或已提交到非 about:blank 的 URL 都算开始。
+// 元素未升级（方法不存在）或停在 about:blank 算没开始。
 function guestLoadStarted() {
   try {
+    if (typeof view.isLoadingMainFrame === 'function' && view.isLoadingMainFrame()) return true
     const url = view.getURL()
     return typeof url === 'string' && url !== '' && url !== 'about:blank'
   } catch { return false }
 }
 
-function ensureWebviewLoaded(retries) {
+function ensureWebviewLoaded(retries, force) {
   const target = currentUrl
   if (lastSetUrl === target && viewReady) {
     clearTimeout(ensureTimer)
@@ -152,18 +154,20 @@ function ensureWebviewLoaded(retries) {
   // 关键：<webview> 自定义元素升级完成前给 .src 赋值只会写到一个普通属性上，元素升级后
   // 仍按初始 src="about:blank" 建访客，赋值被静默丢弃 —— 状态就绪得越早（DSH 已在运行、
   // 首个探测立刻成功）越容易踩中，表现是标题栏"运行中"而内容区全黑。
-  // setAttribute 直接改 DOM 属性，升级前后都有效；再按"访客是否真的开始加载"决定是否补发。
-  if (lastSetUrl !== target || !guestLoadStarted()) {
+  // setAttribute 直接改 DOM 属性，升级前后都有效，所以同步路径只下发一次。
+  // 只有目标变化、或到点仍未开始加载（force）才重发：主进程每次 appendLog 都会 push 状态，
+  // 同步重发会把在途加载反复打断（实测 200ms 推送 + 3s 响应时服务端收到 119 次请求、
+  // 页面永远加载不完）。
+  if (lastSetUrl !== target || force) {
     lastSetUrl = target
     view.setAttribute('src', target)
   }
 
   clearTimeout(ensureTimer)
   ensureTimer = setTimeout(() => {
-    // 只在访客完全没开始加载时重试：已开始的加载不能重设 src，否则会把正在启动的页面打断
     if (currentState === 'ready' && !guestLoadStarted() && retries > 0) {
-      console.log('webview 未开始加载，重试剩余', retries)
-      ensureWebviewLoaded(retries - 1)
+      console.log('webview 未开始加载，补发 src（剩余重试', retries - 1, '）')
+      ensureWebviewLoaded(retries - 1, true)
     }
   }, 1200)
 }

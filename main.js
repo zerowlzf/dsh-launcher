@@ -352,7 +352,7 @@ function versionCmp(a, b) {
 }
 
 // 解析 engines.node 约束：支持 `^x.y.z`、`>=x.y.z`、精确 `x.y.z`，`||` 分隔任一满足即可。
-// 含无法识别的子句时整体返回 null：调用方回退 FALLBACK_ENGINES，而不是误拦或误放。
+// 含无法识别的子句时整体返回 null：调用方跳过版本检查（见 readEnginesRange 的说明）。
 function parseEnginesRange(text) {
   const clauses = String(text || '').split('||').map((s) => s.trim()).filter(Boolean)
   if (!clauses.length) return null
@@ -657,11 +657,10 @@ function startDsh() {
     c.stdout.on('data', (d) => pushStdout(String(d)))
     c.stderr.on('data', (d) => pushStderr(String(d)))
     c.on('error', (e) => {
-      appendLog(`启动失败: ${e.message}`)
       if (child !== c) return   // 迟到事件：新进程已接管，忽略
       child = null
       childStartAt = 0
-      setState({ value: 'failed', pid: null })
+      failStart(`启动失败：${e.message}`)
     })
     c.on('exit', (code, sig) => {
       appendLog(`DSH 进程退出 (code=${code} sig=${sig})`)
@@ -723,9 +722,8 @@ function startDsh() {
       }
     })
   } catch (e) {
-    appendLog(`spawn 异常: ${e.message}`)
     childStartAt = 0
-    setState({ value: 'failed', pid: null })
+    failStart(`spawn 异常：${e.message}`)
   }
 }
 
@@ -773,6 +771,9 @@ function stopDsh() {
           appendLog(`停止未确认：DSH 进程 ${stoppingChild.pid} 在 ${STOP_CONFIRM_MS / 1000} 秒内未退出，端口 ${state.port} 可能仍被占用`)
           notify('DSH 停止未确认', `进程 ${stoppingChild.pid} 未在 ${STOP_CONFIRM_MS / 1000} 秒内退出，可能仍在运行；请查看日志。`)
         }
+      } else if (pid && !(await waitPortFree(STOP_CONFIRM_MS))) {
+        // 外部 DSH 没有子进程对象可等退出事件：用端口是否释放来确认（waitPortFree 自己记日志）
+        notify('DSH 停止未确认', `进程 ${pid} 停止后端口 ${state.port} 仍被占用，可能仍在运行；请查看日志。`)
       }
       child = null
       childStartAt = 0
@@ -914,6 +915,12 @@ function ensureRunning() {
       return
     }
     if (state.value === 'starting' && childStartAt > 0 && Date.now() - childStartAt > START_BUDGET_MS) {
+      if (!child) {
+        // EADDRINUSE 路径留下的"starting 且无子进程"：本来等外部实例就绪，
+        // 超出预算仍不就绪就不再无限等待，置失败让用户能操作（重试/换端口）。
+        failStart(`DSH ${Math.round(START_BUDGET_MS / 1000)} 秒内未就绪（端口 ${state.port} 可能被其它实例占用），请重试`)
+        return
+      }
       // 进程仍活着只是启动慢：不误报"超时失败"（就绪后会自动翻转回 ready），仅提醒一次
       if (!slowBootNotified) {
         slowBootNotified = true
