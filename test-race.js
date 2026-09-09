@@ -22,10 +22,22 @@ function fakeSpawn(cmd, args, opts) {
   c.pid = 5000 + spawned.length
   c.stdout = new EventEmitter()
   c.stderr = new EventEmitter()
+  // 与真实 ChildProcess 同形：运行中 exitCode/signalCode 为 null，
+  // exitsWithin 的"已退出"判定才走真实分支
+  c.exitCode = null
+  c.signalCode = null
   c.unref = () => {}
-  c.kill = () => {}
+  // 真实 kill 会异步触发 exit：停止路径的"确认退出"等待才能在测试里走通
+  c.kill = () => { setImmediate(() => emitExit(c, 0, null)) }
   spawned.push(c)
   return c
+}
+
+// 统一的退出注入：先同步 exitCode/signalCode，再发 exit 事件（顺序与真实 ChildProcess 一致）
+function emitExit(c, code, signal) {
+  c.exitCode = code
+  c.signalCode = signal
+  c.emit('exit', code, signal)
 }
 
 const stubs = {
@@ -87,9 +99,10 @@ process.env.NODE_OPTIONS = '--inspect=127.0.0.1:9229'
 process.env.npm_config_registry = 'https://mirror.invalid/'
 process.env.PNPM_HOME = 'C:\\pnpm-home'
 process.env.corepack_home = 'C:\\corepack'
+process.env.DSH_DESKTOP_SEED = 'C:\\desktop-seed'
 const PATH_BEFORE = process.env.PATH
 const src = fs.readFileSync(mainPath, 'utf8')
-const wrapped = src + '\nmodule.exports.__test = { startDsh, startDshOrFail, stopDsh, relaunchDsh, setCfg, runPreflight, parseVersionTuple, parseEnginesRange, readEnginesRange, isTsxArg, handleInitFailure, CHILD_ENV, getChild: () => child, getState: () => state, setState, getChildStartAt: () => childStartAt }'
+const wrapped = src + '\nmodule.exports.__test = { startDsh, startDshOrFail, stopDsh, relaunchDsh, setCfg, runPreflight, parseVersionTuple, parseEnginesRange, readEnginesRange, isTsxArg, handleInitFailure, CHILD_ENV, classifyExit, writeFileAtomicSync, webDistIndex, getChild: () => child, getState: () => state, setState, getChildStartAt: () => childStartAt }'
 const m = new Module(mainPath, module)
 m.filename = mainPath
 m.paths = Module._nodeModulePaths(path.dirname(mainPath))
@@ -125,7 +138,7 @@ T.setCfg({ dshDir: preflightDshRoot })
   if (!c2 || c2.pid !== 5001) throw new Error('FAIL: #2 未启动')
 
   // 迟到事件：旧进程 #1 的 exit 现在才到达
-  c1.emit('exit', 1, null)
+  emitExit(c1, 1, null)
 
   const cAfter = T.getChild()
   console.log('after stale exit: child =', cAfter && cAfter.pid, '| state =', g.value)
@@ -135,7 +148,7 @@ T.setCfg({ dshDir: preflightDshRoot })
 
   // --- 场景 2：当前进程自然退出（未就绪）仍正确置 failed ---
   g.value = 'starting'
-  c2.emit('exit', 1, null)
+  emitExit(c2, 1, null)
   if (T.getChild() !== null) throw new Error('FAIL: 当前进程退出后 child 应为 null')
   if (g.value !== 'failed') throw new Error(`FAIL: 当前进程退出后应为 failed，实际 ${g.value}`)
   console.log('PASS: 当前进程退出仍正确置 failed')
@@ -152,7 +165,7 @@ T.setCfg({ dshDir: preflightDshRoot })
   // 外部实例先绑端口 → 第二实例 EADDRINUSE 退出。旧代码误置 failed，
   // 外部实例就绪后 failed 防翻转保护会让 UI 卡死；新代码保持 starting + 恢复
   // 启动时间戳，探测循环就绪后自动翻转 ready。
-  c3.emit('exit', 0, null)   // 先让场景 3 的进程退出，释放 child
+  emitExit(c3, 0, null)   // 先让场景 3 的进程退出，释放 child
   g.value = 'starting'
   T.startDsh()                       // #4
   const c4 = T.getChild()
@@ -160,7 +173,7 @@ T.setCfg({ dshDir: preflightDshRoot })
   const startedAt4 = T.getChildStartAt()
   await new Promise((r) => setTimeout(r, 30))   // 让启动时间戳与退出时刻拉开
   c4.stdout.emit('data', 'Error: listen EADDRINUSE: address already in use 127.0.0.1:3080\n')
-  c4.emit('exit', 1, null)
+  emitExit(c4, 1, null)
   if (T.getChild() !== null) throw new Error('FAIL: EADDRINUSE 退出后 child 应为 null')
   if (g.value !== 'starting') throw new Error(`FAIL: EADDRINUSE 应保持 starting 等待，实际 ${g.value}`)
   const restoredAt = T.getChildStartAt()
@@ -173,7 +186,7 @@ T.setCfg({ dshDir: preflightDshRoot })
   const c5 = T.getChild()
   if (!c5 || c5.pid !== 5004) throw new Error('FAIL: #5 未启动')
   c5.stdout.emit('data', 'SyntaxError: Unexpected token in config\n')
-  c5.emit('exit', 1, null)
+  emitExit(c5, 1, null)
   if (g.value !== 'failed') throw new Error(`FAIL: 普通快速失败应为 failed，实际 ${g.value}`)
   console.log('PASS: 非端口占用的快速失败仍正确置 failed')
 
@@ -201,7 +214,7 @@ T.setCfg({ dshDir: preflightDshRoot })
   const c6 = T.getChild()
   if (!c6) throw new Error('FAIL: 兜底场景未拉起')
   c6.stdout.emit('data', "error: unknown option '--no-open'\n")
-  c6.emit('exit', 1, null)              // 快速失败 + no-open 报错 → 触发回退递归
+  emitExit(c6, 1, null)              // 快速失败 + no-open 报错 → 触发回退递归
   const c6b = T.getChild()
   if (!c6b || c6b.pid === c6.pid) throw new Error('FAIL: 兜底递归未重新拉起')
   if (g.value !== 'starting') throw new Error(`FAIL: 兜底递归成功后应为 starting，实际 ${g.value}`)
@@ -220,7 +233,7 @@ T.setCfg({ dshDir: preflightDshRoot })
   if (g.value !== 'idle') throw new Error(`FAIL: 守卫类拒绝应保持 idle 等下一轮探测，实际 ${g.value}`)
   if (!ret6d || ret6d.reason !== rejection6d.reason) throw new Error('FAIL: startDshOrFail 应把拒绝原因原样返回')
   if (ret6d.transient !== true) throw new Error('FAIL: startDshOrFail 应把 transient 标记原样返回')
-  T.getChild().emit('exit', 0, null)     // 收尾：释放子进程，避免影响后续场景
+  emitExit(T.getChild(), 0, null)     // 收尾：释放子进程，避免影响后续场景
   if (T.getChild() !== null) throw new Error('FAIL: 收尾后 child 应为 null')
   console.log('PASS: 守卫类拒绝保持状态等重试，不翻 failed')
 
@@ -345,9 +358,30 @@ T.setCfg({ dshDir: preflightDshRoot })
   }
   console.log('PASS: isTsxArg 门控符合预期')
 
+  // --- 场景 9j：前端静态资源缺失时告警但不拦截（锚点跟随 web-app bundle 的链接）---
+  const feLink = path.join(preflightDshRoot, 'packages/bundle/web-app/node_modules/@deepseek-ai/dsh-web-frontend')
+  fs.mkdirSync(path.join(feLink, 'dist'), { recursive: true })
+  T.setCfg({ startCmd: ['node', '--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'web', '--no-open'] })
+  const logLen9j = g.log.length
+  if (T.runPreflight() !== null) throw new Error('FAIL: 缺前端 dist 不应拦截启动（前端可用 Vite 开发）')
+  if (!g.log.slice(logLen9j).some((l) => l.includes('前端资源未构建'))) throw new Error('FAIL: 缺前端 dist 应告警')
+  fs.writeFileSync(path.join(feLink, 'dist/index.html'), '<html></html>')
+  const logLen9k = g.log.length
+  if (T.runPreflight() !== null) throw new Error('FAIL: 前端 dist 存在时不应告警')
+  if (g.log.slice(logLen9k).some((l) => l.includes('前端资源未构建'))) throw new Error('FAIL: 前端 dist 存在时不应再告警')
+  // 非 web 命令（如 headless）不检查前端资源
+  fs.rmSync(path.join(feLink, 'dist/index.html'), { force: true })
+  T.setCfg({ startCmd: ['node', '--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'headless', 'x'] })
+  const logLen9l = g.log.length
+  T.runPreflight()
+  if (g.log.slice(logLen9l).some((l) => l.includes('前端资源未构建'))) throw new Error('FAIL: 非 web 命令不应检查前端资源')
+  fs.rmSync(path.join(preflightDshRoot, 'packages'), { recursive: true, force: true })   // 清理夹具
+  T.setCfg({ startCmd: ['node', '--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'web', '--no-open'] })
+  console.log('PASS: 前端 dist 预检符合预期')
+
   // --- 场景 12：子进程环境剥离（NODE_OPTIONS / npm_ / pnpm_ / corepack_，保留 PATH）---
   const childEnv = T.CHILD_ENV
-  for (const name of ['NODE_OPTIONS', 'npm_config_registry', 'PNPM_HOME', 'corepack_home']) {
+  for (const name of ['NODE_OPTIONS', 'npm_config_registry', 'PNPM_HOME', 'corepack_home', 'DSH_DESKTOP_SEED']) {
     if (childEnv[name] !== undefined) throw new Error(`FAIL: ${name} 应被剥离，实际 ${JSON.stringify(childEnv[name])}`)
   }
   // Windows 上 PATH 的实际键名是 `Path`：按大小写不敏感查找，避免误判为"被剥离"
@@ -367,6 +401,61 @@ T.setCfg({ dshDir: preflightDshRoot })
   if (!dialogCalls.at(-1)[1].includes('裸字符串异常')) throw new Error('FAIL: 非 Error 输入应转成字符串进弹窗')
   if (exitCalls.at(-1) !== 1) throw new Error('FAIL: 非 Error 输入同样应以退出码 1 退出')
   console.log('PASS: 初始化失败走日志 + 弹窗 + 退出码 1')
+
+  // --- 场景 14：令牌 URL 行即就绪信号，捕获后立即翻 ready（不等下一轮探测）---
+  g.value = 'starting'
+  T.startDsh()
+  const c14 = T.getChild()
+  if (!c14) throw new Error('FAIL: 场景 14 未拉起子进程')
+  c14.stdout.emit('data', 'dsh web: http://127.0.0.1:3080/?token=tok-14\n')
+  if (g.value !== 'ready') throw new Error(`FAIL: 捕获令牌后应立即 ready，实际 ${g.value}`)
+  if (g.pid !== c14.pid) throw new Error(`FAIL: ready 应记录子进程 PID，实际 ${g.pid}`)
+  emitExit(c14, 0, null)
+  console.log('PASS: 令牌行即就绪信号')
+
+  // --- 场景 15：退出原因分类（上游稳定的 stderr 前缀与退出码）---
+  for (const [log, code, want] of [
+    ['dsh: fatal load failure: Error: boom', 1, 'fatal load failure'],
+    ['dsh: plugin tree failed to load: web-app: boom', 1, 'plugin tree failed to load'],
+    ['Error [ERR_MODULE_NOT_FOUND]: Cannot find package "@deepseek-ai/dsh-app-boot"', 1, 'pnpm install'],
+    ["error: unknown option '--nope'", 1, 'unknown option'],
+    ['only noise', 1, null],
+    ['whatever', 130, 'SIGINT'],
+  ]) {
+    const got = T.classifyExit(log, code)
+    if (want === null ? got !== null : !String(got).includes(want)) {
+      throw new Error(`FAIL: classifyExit(${JSON.stringify(log)}, ${code}) = ${JSON.stringify(got)}，应含 ${want}`)
+    }
+  }
+  // 分类结果要落到日志与状态：启动期致命错误不再只说"请查看日志"
+  g.value = 'starting'
+  T.startDsh()
+  const c15 = T.getChild()
+  c15.stdout.emit('data', 'dsh: plugin tree failed to load: web-app: boom\n')
+  emitExit(c15, 1, null)
+  if (g.value !== 'failed') throw new Error(`FAIL: 致命加载失败应置 failed，实际 ${g.value}`)
+  if (!g.log.some((l) => l.includes('启动失败原因：dsh: plugin tree failed to load'))) {
+    throw new Error('FAIL: 应把退出原因写进日志')
+  }
+  console.log('PASS: 退出原因分类符合预期')
+
+  // --- 场景 16：settings.json 原子写（无残留临时文件、可反复覆盖）---
+  const atomicFile = path.join(tmp, 'atomic-settings.json')
+  T.writeFileAtomicSync(atomicFile, '{"a":1}')
+  T.writeFileAtomicSync(atomicFile, '{"a":2}')
+  if (JSON.parse(fs.readFileSync(atomicFile, 'utf8')).a !== 2) throw new Error('FAIL: 原子写覆盖后应为最新内容')
+  const leftovers = fs.readdirSync(tmp).filter((n) => n.startsWith('atomic-settings.json.') && n.endsWith('.tmp'))
+  if (leftovers.length) throw new Error(`FAIL: 原子写残留临时文件 ${JSON.stringify(leftovers)}`)
+  console.log('PASS: 原子写配置符合预期')
+
+  // --- 场景 17：停止确认（子进程退出事件到达才宣告停止）---
+  g.value = 'starting'
+  T.startDsh()
+  if (!T.getChild()) throw new Error('FAIL: 场景 17 未拉起子进程')
+  await T.stopDsh()
+  if (T.getChild() !== null) throw new Error('FAIL: 停止后 child 应为 null')
+  if (g.log.some((l) => l.includes('停止未确认'))) throw new Error('FAIL: 子进程已退出时不应报停止未确认')
+  console.log('PASS: 停止确认符合预期')
 
   console.log('\n全部通过 ✓')
   process.exit(0)
