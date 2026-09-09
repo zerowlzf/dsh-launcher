@@ -4,6 +4,8 @@
 // 访客永远停在 about:blank —— 窗口标题栏显示"运行中"而内容区全黑；且旧重试条件
 // （lastSetUrl !== currentUrl）永不成立，无法自愈。
 // 本测试用桩 preload 立刻回一个 ready 状态，验证 webview 最终真的加载出内容。
+// 确定性：桩 preload 的 getState() 在渲染脚本执行的同一微任务里就 resolve，ready 必然
+// 早于元素升级到达，因此旧实现是 100% 失败（实测 5/5、8/8 红），不是偶发采样。
 // 运行：node test-webview.js   （需要 devDependency electron；窗口全程隐藏）
 const fs = require('fs')
 const os = require('os')
@@ -12,7 +14,17 @@ const http = require('http')
 const net = require('net')
 const { spawn } = require('child_process')
 
-const ITERATIONS = Number(process.env.WEBVIEW_ITER || 5)
+// 迭代次数：显式非法值必须报错而不是悄悄跑 0 次（否则一个竞态回归测试会"空绿"通过）
+const ITERATIONS = (() => {
+  const raw = process.env.WEBVIEW_ITER
+  if (raw === undefined || raw === '') return 5
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 1) {
+    console.error(`WEBVIEW_ITER 必须是正整数，实际 ${JSON.stringify(raw)}`)
+    process.exit(1)
+  }
+  return n
+})()
 const BODY_MARKER = 'WEBVIEW_OK_MARKER'
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -95,13 +107,24 @@ function evaluate(wsUrl, expression) {
   })
 }
 
+// 失败详情里的 URL 一律去掉查询串：CDP target 会带上 ?token=…（本测试是假令牌，
+// 但保持"令牌不进日志"的习惯，避免以后换成真实地址时泄漏）。
+function redactUrl(url) {
+  return String(url).replace(/([?&]token=)[^&\s]+/gi, '$1***')
+}
+
 async function runOnce(appDir, pageUrl, index) {
   const stubPort = new URL(pageUrl).port
   const cdpPort = await freePort()
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), `launcher-webview-ud-${index}-`))
+  // 捕获 Electron 输出：启动失败（缺 DLL、参数错误等）时才有线索，
+  // 否则只会看到"12 秒内没加载出内容"
+  let electronOutput = ''
   const child = spawn(ELECTRON_EXE, [
     appDir, '--hidden', `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${userData}`,
-  ], { cwd: appDir, stdio: 'ignore' })
+  ], { cwd: appDir, stdio: ['ignore', 'pipe', 'pipe'] })
+  child.stdout.on('data', (d) => { electronOutput += String(d) })
+  child.stderr.on('data', (d) => { electronOutput += String(d) })
 
   try {
     for (let i = 0; i < 24; i++) {
@@ -115,12 +138,17 @@ async function runOnce(appDir, pageUrl, index) {
       await sleep(500)
     }
     const list = await targets(cdpPort)
-    const urls = list.map((t) => t.url).join(' | ') || '(无 target)'
-    return { ok: false, detail: `12 秒内 webview 未加载出内容（targets: ${urls}）` }
+    const urls = list.map((t) => redactUrl(t.url)).join(' | ') || '(无 target)'
+    const tail = electronOutput.trim().split('\n').slice(-4).join(' / ')
+    return { ok: false, detail: `12 秒内 webview 未加载出内容（targets: ${urls}）${tail ? ` | electron: ${tail}` : ''}` }
   } finally {
     child.kill()
-    await sleep(400)
-    fs.rmSync(userData, { recursive: true, force: true })
+    // 等进程真正退出再删目录：Windows 上进程仍持有 userData 里的文件时 rmSync 会 EPERM
+    await Promise.race([
+      new Promise((r) => child.once('exit', r)),
+      sleep(3000),
+    ])
+    try { fs.rmSync(userData, { recursive: true, force: true }) } catch { /* 清理失败不影响判定 */ }
   }
 }
 
@@ -130,22 +158,24 @@ async function runOnce(appDir, pageUrl, index) {
     console.error('请先在启动器目录执行 npm install。本测试不会自行下载，避免改写 node_modules。')
     process.exit(1)
   }
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'launcher-webview-test-'))
-  const stubPort = await freePort()
-  const pageUrl = `http://127.0.0.1:${stubPort}/?token=test-token`
-  const server = await startStubServer(stubPort)
-  const appDir = buildHarness(root, pageUrl)
-
+  let root = null
+  let server = null
   let failed = 0
   try {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'launcher-webview-test-'))
+    const stubPort = await freePort()
+    const pageUrl = `http://127.0.0.1:${stubPort}/?token=test-token`
+    server = await startStubServer(stubPort)
+    const appDir = buildHarness(root, pageUrl)
+
     for (let i = 0; i < ITERATIONS; i++) {
       const r = await runOnce(appDir, pageUrl, i)
       if (r.ok) console.log(`PASS: webview 第 ${i + 1} 次加载成功（状态早期就绪也不丢 src）`)
       else { failed++; console.log(`FAIL: 第 ${i + 1} 次 ${r.detail}`) }
     }
   } finally {
-    server.close()
-    fs.rmSync(root, { recursive: true, force: true })
+    if (server) server.close()
+    if (root) { try { fs.rmSync(root, { recursive: true, force: true }) } catch { /* 清理失败不影响判定 */ } }
   }
 
   if (failed > 0) {
