@@ -487,12 +487,15 @@ function runPreflight() {
 function setCfg(patch) { cfg = { ...cfg, ...patch } }
 
 // DSH 子进程继承的环境变量：剥离 shell/调试器污染项（对齐官方桌面端
-// apps/desktop/src/host-process.ts 的做法）。用户从设置了 NODE_OPTIONS 等变量的终端
-// 启动本启动器时，原样继承会导致 DSH 子进程启动失败或行为异常。
+// apps/desktop/src/host-process.ts 的剥离名单：NODE_OPTIONS、NODE_PATH、
+// DSH_DESKTOP_*、npm_*/pnpm_*/corepack_*）。用户从设置了这些变量的终端或 IDE
+// 启动本启动器时，原样继承会导致 DSH 子进程启动失败或解析到非预期模块。
+// NODE_PATH 是 CJS 遗留的全局解析路径，被污染的条目会让 DSH 依赖树解析到别处的包。
 // 只做黑名单剥离：PATH 等正常变量保持原样，node 仍能从 PATH 解析。
 // DSH_DESKTOP_* 一并剥离：那是官方桌面端的私有变量，web 子进程不该继承（边界）。
 const CHILD_ENV = Object.fromEntries(Object.entries(process.env).filter(([name]) => (
   name !== 'NODE_OPTIONS'
+  && name !== 'NODE_PATH'
   && !/^DSH_DESKTOP_/i.test(name)
   && !/^(?:npm|pnpm|corepack)_/i.test(name)
 )))
@@ -645,6 +648,15 @@ function startDsh() {
   try {
     // 用局部变量保存本次 child：旧进程的退出事件可能在新进程接管后才到达
     // （停止→立即重启的竞态），只有"仍是当前进程"的退出才允许改写全局状态。
+    //
+    // spawn 选项有意与官方子进程层不同。官方在
+    // packages/subprocess/subprocess-local/src/spawn.ts 里用
+    // `detached: platform !== 'win32'`：官方掌管的是随父进程一起收掉的**短命工具
+    // 子进程**，脱离进程组反而妨碍它按树回收；本启动器掌管的是必须**活得比启动器久**
+    // 的常驻服务，需要 DSH 独立于启动器的进程组与控制台（Node 文档：Windows 上
+    // detached 让子进程有自己的控制台，因而父进程的控制台关闭事件带不走它）。
+    // windowsHide 压掉随之而来的控制台窗口。换成 detached:false 会丢掉这层独立性，
+    // 故此处保留与官方的差异。
     const c = spawn(cfg.startCmd[0], cfg.startCmd.slice(1), {
       cwd: cfg.dshDir,
       env: CHILD_ENV,
