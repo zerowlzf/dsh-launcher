@@ -100,6 +100,7 @@ Module._load = function (request, parent, isMain) {
 // 加载 main.js 并把内部函数暴露出来供测试驱动
 // CHILD_ENV 在模块加载时快照 process.env：先注入污染变量，再编译，验证剥离名单。
 process.env.NODE_OPTIONS = '--inspect=127.0.0.1:9229'
+process.env.NODE_PATH = 'C:\\stale-modules'
 process.env.npm_config_registry = 'https://mirror.invalid/'
 process.env.PNPM_HOME = 'C:\\pnpm-home'
 process.env.corepack_home = 'C:\\corepack'
@@ -392,9 +393,9 @@ T.setCfg({ dshDir: preflightDshRoot })
   }
   console.log('PASS: isTsxArg 门控符合预期')
 
-  // --- 场景 12：子进程环境剥离（NODE_OPTIONS / npm_ / pnpm_ / corepack_，保留 PATH）---
+  // --- 场景 12：子进程环境剥离（NODE_OPTIONS / NODE_PATH / npm_ / pnpm_ / corepack_，保留 PATH）---
   const childEnv = T.CHILD_ENV
-  for (const name of ['NODE_OPTIONS', 'npm_config_registry', 'PNPM_HOME', 'corepack_home', 'DSH_DESKTOP_SEED']) {
+  for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'npm_config_registry', 'PNPM_HOME', 'corepack_home', 'DSH_DESKTOP_SEED']) {
     if (childEnv[name] !== undefined) throw new Error(`FAIL: ${name} 应被剥离，实际 ${JSON.stringify(childEnv[name])}`)
   }
   // Windows 上 PATH 的实际键名是 `Path`：按大小写不敏感查找，避免误判为"被剥离"

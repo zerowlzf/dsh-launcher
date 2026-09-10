@@ -12,7 +12,7 @@
 
 ## 与官方桌面端的关系
 
-上游 DSH 已出现官方 Electron 桌面端（`apps/desktop` 2026-08-28 起在 master 出现、`apps/desktop-host` 2026-09-04 出现，随 dsh 0.1.5-alpha.1 首次进入发布）：无监听端口（`dsh-app://` 协议 + 字节管道传输）、独占 `$DSH_HOME/profiles/desktop`、与 dsh 同版本发布，且 CLI 已禁止引导该 profile（`dsh --profile desktop` 报错）。启动器与官方桌面端互不冲突——启动器走 web 通道（3080 端口 + 源码模式），桌面端走自有通道与独立 profile。
+上游 DSH 已出现官方 Electron 桌面端（`apps/desktop` 2026-08-28 起在 master 出现、`apps/desktop-host` 2026-09-04 出现，随 dsh 0.1.5-alpha.1 首次进入发布；截至 dsh 0.1.5-rc.2 两个包仍在 master 且仍为 `private: true`）：无监听端口（`dsh-app://` 协议 + 字节管道传输）、独占 `$DSH_HOME/profiles/desktop`、与 dsh 同版本发布，且 CLI 已禁止引导该 profile（`dsh --profile desktop` 报错）。启动器与官方桌面端互不冲突——启动器走 web 通道（3080 端口 + 源码模式），桌面端走自有通道与独立 profile。
 
 按上方「可退役」设计原则，官方桌面端的出现不触发退役——退役只在用户显式决定时生效。本启动器继续使用与维护：官方桌面端面向打包分发与版本一体化场景，启动器覆盖源码模式跟随、托盘驻留与自动重启的既有工作流，两者互不替代。
 
@@ -23,7 +23,7 @@
 
 ## 依赖的上游契约
 
-启动器只依赖下列上游契约，不读 DSH 内部 API。DSH 更新后按本表逐项核对（`核对基线：dsh 0.1.5-alpha.1，HEAD 05b4b0eaac`）。
+启动器只依赖下列上游契约，不读 DSH 内部 API。DSH 更新后按本表逐项核对（`核对基线：dsh 0.1.5-rc.2，HEAD 032c94ad2b`；本次核对覆盖自 `0.1.5-alpha.1` / `05b4b0eaac` 起的 425 个提交，九条契约全部未变，期间契约面唯一改动是 `packages/client/modules/src/index.ts` 的内部重构——helper 迁入 `./client/manifest.ts`，构建提示行为不变）。
 
 | 契约 | 上游位置 | 启动器如何依赖 |
 |---|---|---|
@@ -31,7 +31,7 @@
 | 启动令牌 URL 行 `dsh web: <url>?token=...`（`printUrl` 默认 true；LAN 地址以 `(LAN: ...)` 追加在同一行） | `packages/bundle/web-app/src/index.ts` | 从 stdout 捕获令牌，拼认证 URL 加载内嵌页面 |
 | URL 行同时是**就绪信号**：只在 Loader 全部激活、Connection 可用后打印 | `packages/bundle/web-app/src/index.ts`（`announceReady` 注释与实现）、`packages/bundle/web-app/README.md` | 捕获令牌即翻转为运行中，不必等探测周期 |
 | 探测语义：2xx/3xx = 服务在；401 = 需令牌；其余 = 未就绪 | `packages/client/connection/src/browser-auth.ts` | 探测状态机（ready / 需认证 / degraded） |
-| 前端静态资源位置：前端包的 `dist/index.html`。解析锚点不硬编码目录：先查 web-app bundle 的 `node_modules/@deepseek-ai/dsh-web-frontend` 链接，再回退根 `node_modules`；缺失时服务照样绑定、令牌行照打、`/` 返回 404（上游只对缺失的 client bundle 给构建提示） | `packages/bundle/web-app/src/index.ts`（`resolveDistIndex`）、`packages/host/frontend-static/src/index.ts` | 预检据此在缺失时告警（不拦截），避免内嵌窗口静默 404 |
+| 前端静态资源位置：前端包的 `dist/index.html`。解析锚点不硬编码目录：上游用 `require.resolve('@deepseek-ai/dsh-web-frontend/package.json')` 从 web-app 自身解析（等价于先查 web-app bundle 内的 `node_modules` 链接，再回退根 `node_modules`）；**dist 文件缺失**时服务照样绑定、令牌行照打、`/` 返回 404（上游只对缺失的 client bundle 给构建提示），而前端**包本身不可解析**时 web-app 在装配期直接抛错 | `packages/bundle/web-app/src/index.ts`（`resolveDistIndex`）、`packages/host/frontend-static/src/index.ts` | 预检据此在 dist 缺失时告警（不拦截），避免内嵌窗口静默 404；两种失败模式分别记日志 |
 | 默认 host `127.0.0.1`、默认 port `3080` | `packages/bundle/web-app/cordis.patch.yml` | 探测与内嵌 URL 默认值；端口以 URL 行自报值为准（端口漂移跟随） |
 | 源码启动须走 tsx 的 ESM 钩子（`node --import tsx/esm apps/cli/src/bin.ts`），仓库依赖中需有 `tsx`、入口文件需存在 | 根 `package.json`、`apps/cli/src/bin.ts`、`.agents/notes/implemented/architecture/2026-07-29-dsh-source-launch-tsx-esm.md` | 启动预检（缺 `node_modules/tsx` 提示 `pnpm install`、缺入口提示 `dshDir` 配错） |
 | 根 `package.json` 的 `engines.node` 是源码运行的 node 版本要求 | 根 `package.json` | 启动预检实时读取（读不到回退 `^22.19.0 \|\| >=24.0.0`；读到但解析不了则跳过检查，不拿旧约束误拦），每次拉起现查 |
@@ -81,7 +81,7 @@
 - `dshDir` 默认会优先使用启动器同级的 `deepseek-harness` 目录；如果不存在，再回退到旧版硬编码路径。
 - 如果旧配置里的 `startCmd` 是 `web` 且缺少 `--no-open`，启动器会自动补上并写回配置。
 - `noOpen` 控制是否自动追加 `--no-open`；如果某天 DSH 不再支持该参数，启动器会自动去掉它并写回 `"noOpen": false`。
-- 启动 DSH 子进程时会剥离 `NODE_OPTIONS`、`DSH_DESKTOP_*` 与 `npm_*`/`pnpm_*`/`corepack_*` 环境变量（对齐官方桌面端做法），避免终端里的调试配置（如 `--inspect`）污染 DSH、也不让桌面端私有变量漏进 web 子进程；其余变量（含 `PATH`、`DSH_HOME`、代理变量）正常继承，需要给 DSH 传 Node 选项时请直接写进 `startCmd`（如 `"node", "--max-old-space-size=4096", ...`）。
+- 启动 DSH 子进程时会剥离 `NODE_OPTIONS`、`NODE_PATH`、`DSH_DESKTOP_*` 与 `npm_*`/`pnpm_*`/`corepack_*` 环境变量（剥离名单对齐官方桌面端 `apps/desktop/src/host-process.ts`），避免终端里的调试配置（如 `--inspect`）或遗留的 CJS 全局解析路径污染 DSH 依赖树、也不让桌面端私有变量漏进 web 子进程；其余变量（含 `PATH`、`DSH_HOME`、代理变量）正常继承，需要给 DSH 传 Node 选项时请直接写进 `startCmd`（如 `"node", "--max-old-space-size=4096", ...`）。
 - `settings.json` 采用「临时文件 + fsync + rename」原子写（含令牌；`mode 0600` 在 Windows 上基本无效，实际靠用户目录 ACL）：窗口拖动/令牌捕获这类高频写入即使进程被杀或掉电，最多退回上一个完整版本，不会留下截断的 JSON。
 - 改完重启启动器生效。窗口位置/大小自动记忆。
 
