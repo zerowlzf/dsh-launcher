@@ -72,13 +72,13 @@
 ```json
 {
   "port": 3080,
-  "dshDir": "C:\\Users\\Administrator\\Desktop\\DSH\\deepseek-harness",
+  "dshDir": "<你的 deepseek-harness checkout，例如 D:\\code\\deepseek-harness>",
   "startCmd": ["node", "--import", "tsx/esm", "apps/cli/src/bin.ts", "web", "--no-open"],
   "noOpen": true
 }
 ```
 
-- `dshDir` 默认会优先使用启动器同级的 `deepseek-harness` 目录；如果不存在，再回退到旧版硬编码路径。
+- `dshDir` 默认会优先使用启动器同级的 `deepseek-harness` 目录；如果不存在，再回退到旧版位置（主目录下 `Desktop\dsh\deepseek-harness`，按当前用户主目录推导）。
 - 如果旧配置里的 `startCmd` 是 `web` 且缺少 `--no-open`，启动器会自动补上并写回配置。
 - `noOpen` 控制是否自动追加 `--no-open`；如果某天 DSH 不再支持该参数，启动器会自动去掉它并写回 `"noOpen": false`。
 - 启动 DSH 子进程时会剥离 `NODE_OPTIONS`、`NODE_PATH`、`DSH_DESKTOP_*` 与 `npm_*`/`pnpm_*`/`corepack_*` 环境变量（剥离名单对齐官方桌面端 `apps/desktop/src/host-process.ts`），避免终端里的调试配置（如 `--inspect`）或遗留的 CJS 全局解析路径污染 DSH 依赖树、也不让桌面端私有变量漏进 web 子进程；其余变量（含 `PATH`、`DSH_HOME`、代理变量）正常继承，需要给 DSH 传 Node 选项时请直接写进 `startCmd`（如 `"node", "--max-old-space-size=4096", ...`）。

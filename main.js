@@ -3,11 +3,14 @@
 const { app, BrowserWindow, Tray, Menu, shell, nativeImage, ipcMain, screen, dialog } = require('electron')
 const { spawn, execFile, spawnSync } = require('child_process')
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 const http = require('http')
 
 // ---------------------------------------------------------------- config
-const LEGACY_DSH_DIR = 'C:\\Users\\Administrator\\Desktop\\dsh\\deepseek-harness'
+// 旧版把 checkout 放在「主目录\Desktop\dsh\deepseek-harness」；路径从主目录推导，
+// 不写死某台机器的用户名。
+const LEGACY_DSH_DIR = path.join(os.homedir(), 'Desktop', 'dsh', 'deepseek-harness')
 const DEFAULT_DSH_DIR = path.join(__dirname, '..', 'deepseek-harness')
 
 const DEFAULTS = {
