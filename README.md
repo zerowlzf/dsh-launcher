@@ -23,7 +23,7 @@
 
 ## 依赖的上游契约
 
-启动器只依赖下列上游契约，不读 DSH 内部 API。DSH 更新后按本表逐项核对（`核对基线：dsh 0.1.7-alpha.2，HEAD 00102833df`；本次核对覆盖自 `0.1.5-rc.2` / `032c94ad2b` 起的 3009 个提交，九条契约全部仍然成立。期间契约面唯一需要改写的是别名来源：`dsh <name>` 已成为**通用**缩写规则（0.1.6-alpha.2 起「用 `dsh <profile>` 拉起 profile」），`dsh web` 走的就是这条通用规则，不再是针对 web 的硬编码别名；web 参数族（`--host`/`--port`/`--trusted-host`/`--no-open`）由 web bundle 的 `startup.ts` 自己声明。这两处都已并入下表。另有两项上游变化对本启动器只有正面影响：Web 端内置浏览器改为**默认关闭**（启动器本就追加 `--no-open`，现在是双保险），以及修复了源码启动的运行时模块解析失败）。
+启动器只依赖下列上游契约，不读 DSH 内部 API。DSH 更新后按本表逐项核对（`核对基线：dsh 0.1.7-rc.1，HEAD 46a7f68b09`；本次核对覆盖自 `0.1.7-alpha.2` / `00102833df` 起的 156 个提交，九条契约全部仍然成立，且**契约面一处未改**——该区间内 12 个依赖契约文件（`apps/cli/src/args.ts`、`packages/bundle/web-app/src/startup.ts` 与其 `cordis.patch.yml`、`packages/bundle/web-app/src/index.ts`、`packages/client/connection/src/browser-auth.ts`，以及根 `package.json`）全部未动。上一轮（0.1.5-rc.2 → 0.1.7-alpha.2，3009 个提交）需要改写的只有别名来源一条：`dsh <name>` 已成为**通用**缩写规则，`dsh web` 走的就是它；web 参数族由 web bundle 的 `startup.ts` 声明——两者都已并入下表。另有三项上游变化对本启动器只有正面影响：Web 端内置浏览器改为**默认关闭**（启动器本就追加 `--no-open`，现为双保险）、源码启动的运行时模块解析失败被修复、以及新增的插件兼容性准入只约束**声明了 `@deepseek-ai/dsh*` peer 的插件包**，与本启动器无关）。
 
 | 契约 | 上游位置 | 启动器如何依赖 |
 |---|---|---|
