@@ -960,14 +960,21 @@ function ensureRunning() {
 const PAGE_RECOVERY_LIMIT = 3
 const PAGE_RECOVERY_WINDOW_MS = 60 * 1000
 let pageRecoveryTimes = []
+let pageRecoveryLimitNotified = false
 
 function recoverLauncherPage(where, detail) {
   const now = Date.now()
   pageRecoveryTimes = pageRecoveryTimes.filter((t) => now - t < PAGE_RECOVERY_WINDOW_MS)
   if (pageRecoveryTimes.length >= PAGE_RECOVERY_LIMIT) {
-    appendLog(`启动器界面持续异常（${where}），${Math.round(PAGE_RECOVERY_WINDOW_MS / 1000)} 秒内已自愈 ${pageRecoveryTimes.length} 次，暂停自动重载；请查看日志或重启启动器`)
+    // 停手期间事件可能持续到达，每条都记会刷屏：每个限速周期只记一次，
+    // 下一次自愈成功放行时复位
+    if (!pageRecoveryLimitNotified) {
+      pageRecoveryLimitNotified = true
+      appendLog(`启动器界面持续异常（${where}），${Math.round(PAGE_RECOVERY_WINDOW_MS / 1000)} 秒内已自愈 ${pageRecoveryTimes.length} 次，暂停自动重载；请查看日志或重启启动器`)
+    }
     return
   }
+  pageRecoveryLimitNotified = false
   pageRecoveryTimes.push(now)
   appendLog(`启动器界面异常（${where}${detail ? `：${detail}` : ''}），重新加载界面…`)
   const wc = win?.webContents
@@ -1022,10 +1029,11 @@ function createWindow() {
   // reload 自愈而非 fatal 对话框，反复崩溃由 recoverLauncherPage 限速停手）
   win.webContents.on('did-fail-load', (_e, code, desc, _url, isMainFrame) => {
     // -3(ERR_ABORTED) 是 reload/导航中断的正常副作用，不算失败
-    if (!isMainFrame || code === -3) return
+    if (!isMainFrame || code === -3 || quitting) return
     recoverLauncherPage('页面加载失败', `${code} ${desc ?? ''}`.trim())
   })
   win.webContents.on('preload-error', (_e, _p, err) => {
+    if (quitting) return
     recoverLauncherPage('preload 加载失败', err && err.message ? err.message : String(err))
   })
   win.webContents.on('render-process-gone', (_e, details) => {

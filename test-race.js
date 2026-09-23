@@ -494,7 +494,8 @@ T.setCfg({ dshDir: preflightDshRoot })
   // --- 场景 19：界面自愈（官方桌面端三件套的统一收尾，含限速与停手）---
   // 桩 win 记录 reload 次数。正常路径：记日志 + 500ms 后 reload 一次；
   // 故障注入一：win 已销毁 → 只记日志不 reload（守卫必须能拦住）；
-  // 故障注入二：一分钟内第 4 次起被限速停手 → 不再 reload 并留"暂停自动重载"日志。
+  // 故障注入二：一分钟内第 4 次起被限速停手 → 不再 reload 并留"暂停自动重载"日志，
+  // 且停手日志每周期只记一次（第 5 次到达不得再刷一条）。
   let winReloads = 0
   const fakeWc19 = { isDestroyed: () => false, send() {}, reload: () => { winReloads++ } }
   T.setWin({ isDestroyed: () => true, webContents: fakeWc19 })
@@ -513,8 +514,13 @@ T.setCfg({ dshDir: preflightDshRoot })
   await new Promise((r) => setTimeout(r, 700))
   if (winReloads !== 2) throw new Error(`FAIL: 限速后不应再 reload，实际 ${winReloads} 次`)
   if (!g.log.slice(logLen19).some((l) => l.includes('暂停自动重载'))) throw new Error('FAIL: 触发限速应留停手日志')
+  logLen19 = g.log.length
+  T.recoverLauncherPage('渲染进程退出', 'oom')     // 第 5 次：仍停手，且不应重复刷停手日志
+  await new Promise((r) => setTimeout(r, 700))
+  if (winReloads !== 2) throw new Error(`FAIL: 限速停手后不应再 reload，实际 ${winReloads} 次`)
+  if (g.log.slice(logLen19).some((l) => l.includes('暂停自动重载'))) throw new Error('FAIL: 停手日志应每周期只记一次，不应刷屏')
   T.setWin(null)   // 收尾：不留桩窗口
-  console.log('PASS: 界面自愈（reload + 销毁守卫 + 限速停手）符合预期')
+  console.log('PASS: 界面自愈（reload + 销毁守卫 + 限速停手 + 停手日志节流）符合预期')
 
   console.log('\n全部通过 ✓')
   cleanup()
