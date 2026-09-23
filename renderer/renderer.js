@@ -200,6 +200,27 @@ view.addEventListener('did-fail-load', (e) => {
   bannerRetry.textContent = '重试'
 })
 
+// 访客渲染进程崩溃自愈：吸收官方桌面端（platform-view / browser-guests）对
+// render-process-gone 的处理——官方在宿主崩溃时释放视图，launcher 变体是横幅 +
+// 恢复加载。DSH GUI 是本地服务上的健壮 Web 应用，崩溃多为一时性（GPU 复位/内存
+// 压力），重载即可恢复；探测循环只看服务端，访客崩溃对它不可见，不在这里接住
+// 就是静默黑屏。注意事件形状是 e.details.reason（与主进程 render-process-gone
+// 的参数一致，不是 e.reason）。
+view.addEventListener('render-process-gone', (e) => {
+  const reason = (e && e.details && e.details.reason) || '未知原因'
+  if (reason === 'clean-exit') return
+  viewReady = false
+  console.error('webview render-process-gone:', reason)
+  banner.hidden = false
+  bannerText.textContent = `页面渲染进程退出（${reason}），正在重新加载…`
+  bannerRetry.textContent = '重试'
+  try { view.reload() } catch { /* 访客已死时 reload 偶发抛错 */ }
+  // 双保险：reload 只重载当前提交 URL；若 src 属性已被 303 认证重定向改写（或停在
+  // about:blank），强制重发目标 src 走全新导航。属性值相同的情况下 setAttribute
+  // 不触发变更，不会打断上面 reload 的在途加载。
+  ensureWebviewLoaded(6, true)
+})
+
 view.addEventListener('console-message', (e) => {
   console.log(`[webview] ${e.message}`)
 })

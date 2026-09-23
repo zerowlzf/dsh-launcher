@@ -952,6 +952,30 @@ function ensureRunning() {
 }
 
 // ---------------------------------------------------------------- window
+// 界面自愈：官方桌面端（apps/desktop/src/main.ts）对主窗口接了 did-fail-load /
+// preload-error / render-process-gone 三件套，一律 fatal 报告并出恢复对话框。本启动器
+// 的页面是本地静态资源，异常多为一时性（GPU 复位、内存压力、杀软锁文件），fatal 对话框
+// 是过激反应：记日志 + 延迟 reload 即可自愈。限速 3 次/分钟：反复崩溃说明不是一时性
+// 问题，自动 reload 只会形成风暴，停手并把线索留在 dsh.log 里等用户处置。
+const PAGE_RECOVERY_LIMIT = 3
+const PAGE_RECOVERY_WINDOW_MS = 60 * 1000
+let pageRecoveryTimes = []
+
+function recoverLauncherPage(where, detail) {
+  const now = Date.now()
+  pageRecoveryTimes = pageRecoveryTimes.filter((t) => now - t < PAGE_RECOVERY_WINDOW_MS)
+  if (pageRecoveryTimes.length >= PAGE_RECOVERY_LIMIT) {
+    appendLog(`启动器界面持续异常（${where}），${Math.round(PAGE_RECOVERY_WINDOW_MS / 1000)} 秒内已自愈 ${pageRecoveryTimes.length} 次，暂停自动重载；请查看日志或重启启动器`)
+    return
+  }
+  pageRecoveryTimes.push(now)
+  appendLog(`启动器界面异常（${where}${detail ? `：${detail}` : ''}），重新加载界面…`)
+  const wc = win?.webContents
+  setTimeout(() => {
+    if (win && !win.isDestroyed() && wc && !wc.isDestroyed()) wc.reload()
+  }, 500)
+}
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1280,
@@ -992,6 +1016,22 @@ function createWindow() {
   win.webContents.on('will-navigate', (e, url) => {
     // 初始加载走 loadFile（程序化导航不触发本事件），任何页面发起的导航一律拦截
     if (url !== win.webContents.getURL()) e.preventDefault()
+  })
+
+  // 界面自愈三件套（对齐官方桌面端 main.ts 的接线位置；launcher 变体：本地页面
+  // reload 自愈而非 fatal 对话框，反复崩溃由 recoverLauncherPage 限速停手）
+  win.webContents.on('did-fail-load', (_e, code, desc, _url, isMainFrame) => {
+    // -3(ERR_ABORTED) 是 reload/导航中断的正常副作用，不算失败
+    if (!isMainFrame || code === -3) return
+    recoverLauncherPage('页面加载失败', `${code} ${desc ?? ''}`.trim())
+  })
+  win.webContents.on('preload-error', (_e, _p, err) => {
+    recoverLauncherPage('preload 加载失败', err && err.message ? err.message : String(err))
+  })
+  win.webContents.on('render-process-gone', (_e, details) => {
+    if (quitting) return
+    if (details && details.reason === 'clean-exit') return
+    recoverLauncherPage('渲染进程退出', details ? details.reason : '未知原因')
   })
 
   win.once('ready-to-show', () => {

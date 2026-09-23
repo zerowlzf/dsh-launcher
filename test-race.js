@@ -107,7 +107,7 @@ process.env.corepack_home = 'C:\\corepack'
 process.env.DSH_DESKTOP_SEED = 'C:\\desktop-seed'
 const PATH_BEFORE = process.env.PATH
 const src = fs.readFileSync(mainPath, 'utf8')
-const wrapped = src + '\nmodule.exports.__test = { startDsh, startDshOrFail, stopDsh, relaunchDsh, setCfg, runPreflight, parseVersionTuple, parseEnginesRange, readEnginesRange, isTsxArg, handleInitFailure, CHILD_ENV, classifyExit, writeFileAtomicSync, webDistIndexPath, getChild: () => child, getState: () => state, setState, getChildStartAt: () => childStartAt }'
+const wrapped = src + '\nmodule.exports.__test = { startDsh, startDshOrFail, stopDsh, relaunchDsh, setCfg, runPreflight, parseVersionTuple, parseEnginesRange, readEnginesRange, isTsxArg, handleInitFailure, recoverLauncherPage, setWin: (w) => { win = w }, CHILD_ENV, classifyExit, writeFileAtomicSync, webDistIndexPath, getChild: () => child, getState: () => state, setState, getChildStartAt: () => childStartAt }'
 const m = new Module(mainPath, module)
 m.filename = mainPath
 m.paths = Module._nodeModulePaths(path.dirname(mainPath))
@@ -490,6 +490,31 @@ T.setCfg({ dshDir: preflightDshRoot })
   emitExit(c18, 0, null)  // 收尾：进程最终退出
   g.value = 'idle'
   console.log('PASS: 停止未确认（卡住不退出）符合预期')
+
+  // --- 场景 19：界面自愈（官方桌面端三件套的统一收尾，含限速与停手）---
+  // 桩 win 记录 reload 次数。正常路径：记日志 + 500ms 后 reload 一次；
+  // 故障注入一：win 已销毁 → 只记日志不 reload（守卫必须能拦住）；
+  // 故障注入二：一分钟内第 4 次起被限速停手 → 不再 reload 并留"暂停自动重载"日志。
+  let winReloads = 0
+  const fakeWc19 = { isDestroyed: () => false, send() {}, reload: () => { winReloads++ } }
+  T.setWin({ isDestroyed: () => true, webContents: fakeWc19 })
+  let logLen19 = g.log.length
+  T.recoverLauncherPage('渲染进程退出', 'oom')
+  await new Promise((r) => setTimeout(r, 700))
+  if (winReloads !== 0) throw new Error(`FAIL: win 已销毁时不应 reload，实际 ${winReloads} 次`)
+  if (!g.log.slice(logLen19).some((l) => l.includes('渲染进程退出'))) throw new Error('FAIL: 界面异常应写日志')
+  T.setWin({ isDestroyed: () => false, webContents: fakeWc19 })
+  T.recoverLauncherPage('渲染进程退出', 'oom')     // 窗口内第 2 次（第 1 次已计入预算）
+  T.recoverLauncherPage('页面加载失败', 'boom')    // 第 3 次
+  await new Promise((r) => setTimeout(r, 700))
+  if (winReloads !== 2) throw new Error(`FAIL: 两次自愈应各 reload 一次，实际 ${winReloads} 次`)
+  logLen19 = g.log.length
+  T.recoverLauncherPage('渲染进程退出', 'oom')     // 第 4 次：超限，必须停手
+  await new Promise((r) => setTimeout(r, 700))
+  if (winReloads !== 2) throw new Error(`FAIL: 限速后不应再 reload，实际 ${winReloads} 次`)
+  if (!g.log.slice(logLen19).some((l) => l.includes('暂停自动重载'))) throw new Error('FAIL: 触发限速应留停手日志')
+  T.setWin(null)   // 收尾：不留桩窗口
+  console.log('PASS: 界面自愈（reload + 销毁守卫 + 限速停手）符合预期')
 
   console.log('\n全部通过 ✓')
   cleanup()

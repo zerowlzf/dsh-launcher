@@ -9,6 +9,8 @@
 // 阶段二（慢加载 + 200ms 状态推送）：确定性锁死"不得反复重设 src 打断在途加载"。
 //   曾出现的回归是同步路径按"是否已开始加载"重发，服务端 3 秒响应时被重发 149 次、
 //   页面永远加载不完；本阶段断言最终加载成功且服务端只收到 1 次请求。
+// 阶段三（崩溃自愈）：CDP Page.crash 注入访客渲染进程崩溃，断言 render-process-gone
+//   处理把访客拉回来（服务端收到新请求 + 内容重新可见）——不接住就是静默黑屏。
 // 运行：node test-webview.js   （需要 devDependency electron；窗口全程隐藏）
 const fs = require('fs')
 const os = require('os')
@@ -101,20 +103,27 @@ async function targets(port) {
   try { return await (await fetch(`http://127.0.0.1:${port}/json/list`)).json() } catch { return [] }
 }
 
-function evaluate(wsUrl, expression) {
+function cdpSend(wsUrl, method, params = {}) {
   return new Promise((resolve) => {
     const ws = new WebSocket(wsUrl)
     const timer = setTimeout(() => { try { ws.close() } catch { /* 已关闭 */ } ; resolve(null) }, 8000)
-    ws.onopen = () => ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, returnByValue: true } }))
+    ws.onopen = () => ws.send(JSON.stringify({ id: 1, method, params }))
     ws.onmessage = (ev) => {
       const msg = JSON.parse(String(ev.data))
       if (msg.id === 1) {
         clearTimeout(timer)
         try { ws.close() } catch { /* 已关闭 */ }
-        resolve(msg.result && msg.result.result ? msg.result.result.value : null)
+        resolve(msg.result ?? null)
       }
     }
     ws.onerror = () => { clearTimeout(timer); resolve(null) }
+  })
+}
+
+function evaluate(wsUrl, expression) {
+  return cdpSend(wsUrl, 'Runtime.evaluate', { expression, returnByValue: true }).then((r) => {
+    const result = r && r.result
+    return result ? result.value : null
   })
 }
 
@@ -124,6 +133,15 @@ function redactUrl(url) {
   return String(url).replace(/([?&]token=)[^&\s]+/gi, '$1***')
 }
 
+// 剥离 ELECTRON_RUN_AS_NODE 后再 spawn electron.exe：宿主环境（某些 IDE/终端会带）若
+// 设置了该变量，electron 会以 Node 模式执行 main.js（require('electron') 得到空对象、
+// app 为 undefined，启动即崩），测试会以"webview 未加载"的假象误红。测试必须自带封闭性。
+function spawnElectron(args, opts) {
+  const env = { ...process.env }
+  delete env.ELECTRON_RUN_AS_NODE
+  return spawn(ELECTRON_EXE, args, { ...opts, env })
+}
+
 async function runOnce(appDir, pageUrl, index, waitMs = 12000) {
   const stubPort = new URL(pageUrl).port
   const cdpPort = await freePort()
@@ -131,7 +149,7 @@ async function runOnce(appDir, pageUrl, index, waitMs = 12000) {
   // 捕获 Electron 输出：启动失败（缺 DLL、参数错误等）时才有线索，
   // 否则只会看到"webview 未加载出内容"
   let electronOutput = ''
-  const child = spawn(ELECTRON_EXE, [
+  const child = spawnElectron([
     appDir, '--hidden', `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${userData}`,
   ], { cwd: appDir, stdio: ['ignore', 'pipe', 'pipe'] })
   child.stdout.on('data', (d) => { electronOutput += String(d) })
@@ -161,6 +179,80 @@ async function runOnce(appDir, pageUrl, index, waitMs = 12000) {
     ])
     try { fs.rmSync(userData, { recursive: true, force: true }) } catch { /* 清理失败不影响判定 */ }
   }
+}
+
+// 阶段三：访客渲染进程崩溃自愈（故障注入）。
+// 用 CDP Page.crash 杀掉已加载完成的访客渲染进程，断言 render-process-gone 处理
+// 把访客拉回来：服务端收到第二次请求且内容重新可见。不接住的话，访客崩溃对探测
+// 循环不可见（服务端仍 2xx），表现为静默黑屏。
+async function runCrashOnce(appDir, pageUrl, index) {
+  const stubPort = new URL(pageUrl).port
+  const cdpPort = await freePort()
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), `launcher-webview-crash-${index}-`))
+  let electronOutput = ''
+  const child = spawnElectron([
+    appDir, '--hidden', `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${userData}`,
+  ], { cwd: appDir, stdio: ['ignore', 'pipe', 'pipe'] })
+  child.stdout.on('data', (d) => { electronOutput += String(d) })
+  child.stderr.on('data', (d) => { electronOutput += String(d) })
+
+  const findGuest = async () => {
+    const list = await targets(cdpPort)
+    return list.find((t) => t.url.includes(`127.0.0.1:${stubPort}`))
+  }
+  const guestText = async (guest) => {
+    if (!guest) return ''
+    const text = await evaluate(guest.webSocketDebuggerUrl, 'document.body ? document.body.innerText : ""')
+    return typeof text === 'string' ? text : ''
+  }
+
+  try {
+    // 1) 等初始加载完成
+    let guest = null
+    for (let i = 0; i < 24 && !guest; i++) {
+      guest = await findGuest()
+      if (guest && (await guestText(guest)).includes(BODY_MARKER)) break
+      guest = null
+      await sleep(500)
+    }
+    if (!guest) {
+      const list = await targets(cdpPort)
+      return { ok: false, detail: `崩溃注入前访客未完成初始加载（targets: ${list.map((t) => redactUrl(t.url)).join(' | ')}）` }
+    }
+    // 2) 注入崩溃：杀掉访客渲染进程
+    const requestsBefore = crashRequestCount
+    await cdpSend(guest.webSocketDebuggerUrl, 'Page.crash')
+    // 3) 等自愈：服务端收到新请求且内容重新可见
+    for (let i = 0; i < 40; i++) {
+      await sleep(500)
+      if (crashRequestCount > requestsBefore) {
+        const g2 = await findGuest()
+        if ((await guestText(g2)).includes(BODY_MARKER)) return { ok: true }
+      }
+    }
+    const tail = electronOutput.trim().split('\n').slice(-4).join(' / ')
+    return { ok: false, detail: `访客崩溃后 ${20} 秒内未恢复（请求数 ${crashRequestCount}）${tail ? ` | electron: ${tail}` : ''}` }
+  } finally {
+    child.kill()
+    await Promise.race([
+      new Promise((r) => child.once('exit', r)),
+      sleep(3000),
+    ])
+    try { fs.rmSync(userData, { recursive: true, force: true }) } catch { /* 清理失败不影响判定 */ }
+  }
+}
+
+// 崩溃阶段的桩服务请求计数：runCrashOnce 前置 + 后置各读一次
+let crashRequestCount = 0
+function startCountingServer(port) {
+  return new Promise((resolve) => {
+    const srv = http.createServer((req, res) => {
+      crashRequestCount++
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(`<!doctype html><meta charset="utf-8"><title>stub</title><body>${BODY_MARKER}</body>`)
+    })
+    srv.listen(port, '127.0.0.1', () => resolve(srv))
+  })
 }
 
 ;(async () => {
@@ -202,6 +294,21 @@ async function runOnce(appDir, pageUrl, index, waitMs = 12000) {
       console.log(`FAIL: 慢加载用例 ${slowRun.ok ? '已加载' : slowRun.detail}，但服务端收到 ${slowRequests} 次请求（应为 1）`)
     }
     slow.srv.close()
+
+    // 阶段三：访客渲染进程崩溃自愈（CDP Page.crash 注入，验证 render-process-gone 处理）
+    const crashPort = await freePort()
+    const crashUrl = `http://127.0.0.1:${crashPort}/?token=test-token`
+    const crashSrv = await startCountingServer(crashPort)
+    crashRequestCount = 0
+    const crashApp = buildHarness(root, crashUrl)
+    const crashRun = await runCrashOnce(crashApp, crashUrl, 'crash')
+    if (crashRun.ok) {
+      console.log('PASS: 访客渲染进程崩溃后自动恢复（render-process-gone → reload）')
+    } else {
+      failed++
+      console.log(`FAIL: 崩溃自愈用例 ${crashRun.detail}`)
+    }
+    crashSrv.close()
   } finally {
     if (server) server.srv.close()
     if (root) { try { fs.rmSync(root, { recursive: true, force: true }) } catch { /* 清理失败不影响判定 */ } }
@@ -211,6 +318,6 @@ async function runOnce(appDir, pageUrl, index, waitMs = 12000) {
     console.error(`\n${failed} 项失败：webview 竞态/重入回归`)
     process.exit(1)
   }
-  console.log(`\n全部通过 ✓（快加载 ${ITERATIONS} 次 + 慢加载 1 次）`)
+  console.log(`\n全部通过 ✓（快加载 ${ITERATIONS} 次 + 慢加载 1 次 + 崩溃自愈 1 次）`)
   process.exit(0)
 })().catch((e) => { console.error(e); process.exit(1) })

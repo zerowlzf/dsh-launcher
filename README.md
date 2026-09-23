@@ -18,12 +18,19 @@
 
 **边界**：启动器不启动、不托管、不集成官方桌面端（`apps/desktop` / `apps/desktop-host`），不读写 `$DSH_HOME/profiles/desktop`，不传 `--profile desktop`。官方桌面端会发展出自己的完整生态（自有启动器、更新与分发体系），那是它的路；本启动器走自己的路——把源码模式跟随做到极致，不向它的生态伸手，也不等它来收编。两条路唯一的交集是同一个上游仓库，除此之外互为平行线。
 
+**吸收记录（0.1.7-rc.1 轮，2026-09-24）**：对照桌面版 `apps/desktop/src` 当前实现逐文件评估后，吸收主窗口崩溃自愈三件套与 webview 访客 `render-process-gone` 恢复（见功能表「界面自愈」「访客崩溃自愈」）。评估后**不吸收**的项及理由：
+
+- **crash-report 文件 + fatal 恢复对话框体系**（`crash-report.ts` / `fatal-recovery.ts`）：桌面端面向打包分发、需给非技术用户留完整诊断文件；本启动器 dsh.log 已持久化全部带时间戳输出，启动失败有原因翻译 + 窗口内日志 + 复制日志按钮，覆盖同类需求
+- **IPC 优雅停机阶梯**（`host-process.ts` 的 shutdown → 10s → SIGTERM → 5s → SIGKILL）：桌面端走 Node 模式 IPC 通道有 `shutdown` 消息可发；CLI 拉起的 web 子进程没有 IPC 通道，Windows 上 detached 控制台进程也收不到优雅信号，`taskkill /T /F` 是惯用法，且 DSH 会话日志为追加写、强杀风险低
+- **update / mandatory-update 自更新体系**：本启动器的分发即本 git 仓库，随源码模式显式更新，符合「可退役」哲学；自更新反而引入回滚与签名问题
+- **并发 attempt 共享、stderr 有界缓冲、exitsWithin+unref、EADDRINUSE 特判、env 剥离名单、单实例锁**：在此前各轮已对齐（见 `main.js` 注释与 CHILD_ENV），本轮复核无漂移
+
 - 体验官方桌面端（与启动器无关，仅备忘）：仓库根执行 `pnpm run dev:desktop`（构建后可直接 `pnpm run start:desktop`）；正式 Windows 安装包走 `pnpm run package:desktop:win:x64`（发布级需 EV 签名基础设施，`:dir` 变体产出免安装目录）
 - 若用户显式决定退役：直接删除本目录即可，DSH 本体与官方桌面端不受影响（配置与日志见「卸载」）
 
 ## 依赖的上游契约
 
-启动器只依赖下列上游契约，不读 DSH 内部 API。DSH 更新后按本表逐项核对（`核对基线：dsh 0.1.7-rc.1，HEAD 46a7f68b09`；本次核对覆盖自 `0.1.7-alpha.2` / `00102833df` 起的 156 个提交，九条契约全部仍然成立，且**契约面一处未改**——该区间内 12 个依赖契约文件（`apps/cli/src/args.ts`、`packages/bundle/web-app/src/startup.ts` 与其 `cordis.patch.yml`、`packages/bundle/web-app/src/index.ts`、`packages/client/connection/src/browser-auth.ts`，以及根 `package.json`）全部未动。上一轮（0.1.5-rc.2 → 0.1.7-alpha.2，3009 个提交）需要改写的只有别名来源一条：`dsh <name>` 已成为**通用**缩写规则，`dsh web` 走的就是它；web 参数族由 web bundle 的 `startup.ts` 声明——两者都已并入下表。另有三项上游变化对本启动器只有正面影响：Web 端内置浏览器改为**默认关闭**（启动器本就追加 `--no-open`，现为双保险）、源码启动的运行时模块解析失败被修复、以及新增的插件兼容性准入只约束**声明了 `@deepseek-ai/dsh*` peer 的插件包**，与本启动器无关）。
+启动器只依赖下列上游契约，不读 DSH 内部 API。DSH 更新后按本表逐项核对（`核对基线：dsh 0.1.7-rc.1，HEAD 46a7f68b09`；本次核对覆盖自 `0.1.7-alpha.2` / `00102833df` 起的 156 个提交，九条契约全部仍然成立，且**契约面一处未改**——该区间内 12 个依赖契约文件（`apps/cli/src/args.ts`、`packages/bundle/web-app/src/startup.ts` 与其 `cordis.patch.yml`、`packages/bundle/web-app/src/index.ts`、`packages/client/connection/src/browser-auth.ts`，以及根 `package.json`）全部未动。上一轮（0.1.5-rc.2 → 0.1.7-alpha.2，3009 个提交）需要改写的只有别名来源一条：`dsh <name>` 已成为**通用**缩写规则，`dsh web` 走的就是它；web 参数族由 web bundle 的 `startup.ts` 声明——两者都已并入下表。另有三项上游变化对本启动器只有正面影响：Web 端内置浏览器改为**默认关闭**（启动器本就追加 `--no-open`，现为双保险）、源码启动的运行时模块解析失败被修复、以及新增的插件兼容性准入只约束**声明了 `@deepseek-ai/dsh*` peer 的插件包**，与本启动器无关）。**2026-09-24 工作树复核**：本地 master 在 0.1.7-rc.1 之上另叠 8 个本地补丁提交（HEAD `cfcca37e05`，详见主仓 git log）。12 个契约文件中仅 2 个被本地补丁触碰，且都是追加式、与本启动器依赖的事实无关：`cordis.patch.yml` 新增 ui-billing 插件行（不触碰 host/port 默认值）、`index.ts` 给浏览器启动器 spawn 补 `windowsHide: true`（启动器恒带 `--no-open`，该路径不会执行）；其余 10 个未动。九条契约在当前工作树（含全部本地补丁）上逐项实测仍全部成立。
 
 | 契约 | 上游位置 | 启动器如何依赖 |
 |---|---|---|
@@ -61,6 +68,8 @@
 | 断线横幅 | DSH 挂掉自动检测并提示，恢复后重连 |
 | 内嵌加载兜底 | 状态早于 `<webview>` 自定义元素升级就绪时（DSH 已在运行 → 首个探测立刻成功），旧的 `view.src = …` 赋值会被元素升级丢弃、访客停在 `about:blank`，表现为标题栏"运行中"而内容区全黑。改为 `setAttribute('src')` 下发，并以"访客是否真的开始加载"为准补发（仅未开始加载时重试，不打断正在启动的页面）；`test-webview.js` 把这条锁死（2026-09-09 事故） |
 | 托盘唤醒 | 点托盘图标时在 `show()`/`focus()` 之后 `moveTop()`，规避 Windows 前台锁导致的"点两次才打开" |
+| 界面自愈 | 吸收官方桌面端（`apps/desktop/src/main.ts`）主窗口三件套：`render-process-gone`（非 clean-exit）/ `preload-error` / `did-fail-load`（主框架、非 -3）统一收尾——记日志 + 延迟 500ms reload 自愈；**限速 3 次/分钟**，超限停手留日志（防反复崩溃形成 reload 风暴）。官方对该三件套出 fatal 恢复对话框，本启动器页面是本地静态资源，崩溃多为一时性，自愈优于打断用户 |
+| 访客崩溃自愈 | 内嵌 webview 的**渲染进程**崩溃（`render-process-gone`，对应官方 platform-view/browser-guests 的处理）：横幅提示 + reload 恢复 + 强制重发 src 兜底。访客崩溃对服务端探测不可见（仍 2xx），不接住就是"标题栏运行中、内容区黑屏"的静默故障；`test-webview.js` 阶段三用 CDP `Page.crash` 故障注入锁死该路径 |
 | 重试语义 | 窗口内的「重试 / 启动 DSH」与托盘「重新启动 DSH」共用一条停止→等端口→拉起流程：先校验端口上进程确实是 DSH（`looksLikeDsh`），是则停止并由本启动器重新拉起；端口被无关服务占用时不动作，仅在日志提示。拉起被拒绝时分两类收尾：预检类（node 版本 / 依赖缺失 / 入口缺失）置失败态并弹泡给出可行动的原因；守卫类（停止进行中、已有子进程）只记日志并保持可自愈状态等下一轮探测重试，用户点击触发的路径额外弹泡告知本次未生效。若启动时端口被正在冷启动的另一个 DSH 实例占用（EADDRINUSE），保持探测等待、就绪后自动转为运行中 |
 | 端口漂移告警 | 检测到 DSH 输出中自报的监听端口与配置 `port` 不一致时，弹泡提醒修改 settings.json |
 | **启动令牌认证** | 新版 DSH web 需要 `?token=` 启动令牌才能访问。启动器会在 DSH 输出行 `dsh web: http://127.0.0.1:PORT/?token=...` 中自动捕获令牌，并使用带令牌的认证 URL 加载 webview 页面。令牌会持久化到 settings.json，重启启动器后若 DSH 进程仍在运行，可复用令牌直接认证。 |
