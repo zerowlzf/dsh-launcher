@@ -12,7 +12,7 @@
 
 ## 与官方桌面端的关系
 
-上游 DSH 已出现官方 Electron 桌面端（`apps/desktop` 2026-08-28 起在 master 出现、`apps/desktop-host` 2026-09-04 出现，随 dsh 0.1.5-alpha.1 首次进入发布；截至 dsh 0.1.5-rc.2 两个包仍在 master 且仍为 `private: true`）：无监听端口（`dsh-app://` 协议 + 字节管道传输）、独占 `$DSH_HOME/profiles/desktop`、与 dsh 同版本发布，且 CLI 已禁止引导该 profile（`dsh --profile desktop` 报错）。启动器与官方桌面端互不冲突——启动器走 web 通道（3080 端口 + 源码模式），桌面端走自有通道与独立 profile。
+上游 DSH 已出现官方 Electron 桌面端（`apps/desktop` 2026-08-28 起在 master 出现、`apps/desktop-host` 2026-09-04 出现，随 dsh 0.1.5-alpha.1 首次进入发布；截至 dsh 0.1.7-alpha.2 两个包仍在 master 且仍为 `private: true`，版本随发布号）：无监听端口（`dsh-app://` 协议 + 字节管道传输）、独占 `$DSH_HOME/profiles/desktop`、与 dsh 同版本发布，且 CLI 已禁止引导该 profile（`dsh --profile desktop` 报错）。启动器与官方桌面端互不冲突——启动器走 web 通道（3080 端口 + 源码模式），桌面端走自有通道与独立 profile。
 
 按上方「可退役」设计原则，官方桌面端的出现不触发退役——退役只在用户显式决定时生效。本启动器继续使用与维护：官方桌面端面向打包分发与版本一体化场景，启动器覆盖源码模式跟随、托盘驻留与自动重启的既有工作流，两者互不替代。
 
@@ -23,11 +23,11 @@
 
 ## 依赖的上游契约
 
-启动器只依赖下列上游契约，不读 DSH 内部 API。DSH 更新后按本表逐项核对（`核对基线：dsh 0.1.5-rc.2，HEAD 032c94ad2b`；本次核对覆盖自 `0.1.5-alpha.1` / `05b4b0eaac` 起的 425 个提交，九条契约全部未变，期间契约面唯一改动是 `packages/client/modules/src/index.ts` 的内部重构——helper 迁入 `./client/manifest.ts`，构建提示行为不变）。
+启动器只依赖下列上游契约，不读 DSH 内部 API。DSH 更新后按本表逐项核对（`核对基线：dsh 0.1.7-alpha.2，HEAD 00102833df`；本次核对覆盖自 `0.1.5-rc.2` / `032c94ad2b` 起的 3009 个提交，九条契约全部仍然成立。期间契约面唯一需要改写的是别名来源：`dsh <name>` 已成为**通用**缩写规则（0.1.6-alpha.2 起「用 `dsh <profile>` 拉起 profile」），`dsh web` 走的就是这条通用规则，不再是针对 web 的硬编码别名；web 参数族（`--host`/`--port`/`--trusted-host`/`--no-open`）由 web bundle 的 `startup.ts` 自己声明。这两处都已并入下表。另有两项上游变化对本启动器只有正面影响：Web 端内置浏览器改为**默认关闭**（启动器本就追加 `--no-open`，现在是双保险），以及修复了源码启动的运行时模块解析失败）。
 
 | 契约 | 上游位置 | 启动器如何依赖 |
 |---|---|---|
-| `dsh web` 是 `--profile web` 的硬编码别名；web 参数族含 `--no-open`、`--host`、`--port`、`--trusted-host` | `apps/cli/src/args.ts`、`packages/bundle/web-app/src/startup.ts` | `startCmd` 启动参数；`--no-open` 缺失时自动补，上游不认时自动回退 |
+| `dsh <name>` 缩写 `dsh --profile <name>`（通用规则，`dsh web` 即 `--profile web`）；web 参数族含 `--no-open`、`--host`、`--port`、`--trusted-host` | `apps/cli/src/args.ts`（通用缩写的规则与文档）、`packages/bundle/web-app/src/startup.ts`（参数族声明） | `startCmd` 启动参数；`--no-open` 缺失时自动补，上游不认时自动回退 |
 | 启动令牌 URL 行 `dsh web: <url>?token=...`（`printUrl` 默认 true；LAN 地址以 `(LAN: ...)` 追加在同一行） | `packages/bundle/web-app/src/index.ts` | 从 stdout 捕获令牌，拼认证 URL 加载内嵌页面 |
 | URL 行同时是**就绪信号**：只在 Loader 全部激活、Connection 可用后打印 | `packages/bundle/web-app/src/index.ts`（`announceReady` 注释与实现）、`packages/bundle/web-app/README.md` | 捕获令牌即翻转为运行中，不必等探测周期 |
 | 探测语义：2xx/3xx = 服务在；401 = 需令牌；其余 = 未就绪 | `packages/client/connection/src/browser-auth.ts` | 探测状态机（ready / 需认证 / degraded） |
