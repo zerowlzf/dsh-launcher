@@ -1100,8 +1100,12 @@ function showWindow() {
 
 // ---------------------------------------------------------------- tray
 function createTray() {
-  // 白色鲸鱼：Win11 深色任务栏上黑色图标不可见
-  tray = new Tray(nativeImage.createFromPath(path.join(assetsDir, 'tray-32.png')))
+  // 白色鲸鱼：Win11 深色任务栏上黑色图标不可见。
+  // 托盘用逐尺寸 ICO（assets/tray.ico，make-tray-ico.js 生成）：Windows 按显示缩放
+  // 自挑最合适的位图，100%–400% 下边缘都清晰（吸收官方 desktop 的做法）；
+  // ico 缺失或不可用时回退单尺寸 tray-32.png。
+  const icoImage = nativeImage.createFromPath(path.join(assetsDir, 'tray.ico'))
+  tray = new Tray(icoImage.isEmpty() ? nativeImage.createFromPath(path.join(assetsDir, 'tray-32.png')) : icoImage)
   tray.setToolTip(`DSH 启动器 · ${baseUrl()}`)
   const menu = Menu.buildFromTemplate([
     { label: '显示启动器窗口', click: showWindow },
