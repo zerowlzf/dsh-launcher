@@ -12,7 +12,7 @@
 
 ## 与官方桌面端的关系
 
-上游 DSH 已出现官方 Electron 桌面端（`apps/desktop` 2026-08-28 起在 master 出现、`apps/desktop-host` 2026-09-04 出现，随 dsh 0.1.5-alpha.1 首次进入发布；截至 dsh 0.1.7-alpha.2 两个包仍在 master 且仍为 `private: true`，版本随发布号）：无监听端口（`dsh-app://` 协议 + 字节管道传输）、独占 `$DSH_HOME/profiles/desktop`、与 dsh 同版本发布，且 CLI 已禁止引导该 profile（`dsh --profile desktop` 报错）。启动器与官方桌面端互不冲突——启动器走 web 通道（3080 端口 + 源码模式），桌面端走自有通道与独立 profile。
+上游 DSH 已出现官方 Electron 桌面端（`apps/desktop` 2026-08-28 起在 master 出现、`apps/desktop-host` 2026-09-04 出现，随 dsh 0.1.5-alpha.1 首次进入发布；截至 dsh 0.1.7-rc.2 两个包仍在 master 且仍为 `private: true`，版本随发布号，实测 `@deepseek-ai/dsh-desktop` 与 `@deepseek-ai/dsh-desktop-host` 的 `version` 均为 `0.1.7-rc.2`）：无监听端口（`dsh-app://` 协议 + 字节管道传输）、独占 `$DSH_HOME/profiles/desktop`、与 dsh 同版本发布，且 CLI 已禁止引导该 profile（`dsh --profile desktop` 报错）。启动器与官方桌面端互不冲突——启动器走 web 通道（3080 端口 + 源码模式），桌面端走自有通道与独立 profile。
 
 按上方「可退役」设计原则，官方桌面端的出现不触发退役——退役只在用户显式决定时生效。本启动器继续使用与维护：官方桌面端面向打包分发与版本一体化场景，启动器覆盖源码模式跟随、托盘驻留与自动重启的既有工作流，两者互不替代。
 
@@ -25,12 +25,31 @@
 - **update / mandatory-update 自更新体系**：本启动器的分发即本 git 仓库，随源码模式显式更新，符合「可退役」哲学；自更新反而引入回滚与签名问题
 - **并发 attempt 共享、stderr 有界缓冲、exitsWithin+unref、EADDRINUSE 特判、env 剥离名单、单实例锁**：在此前各轮已对齐（见 `main.js` 注释与 CHILD_ENV），本轮复核无漂移
 
+**吸收记录（0.1.7-rc.2 轮，2026-09-26）**：对照桌面端 rc.1→rc.2 增量（`46a7f68b09..477b4f4205`，`apps/desktop` + `apps/desktop-host` 共 103 文件 +5191/−377）按 14 个主题逐项评估、0 遗漏。唯一吸收项为**托盘图标逐尺寸渲染**（本轮已落地：`make-tray-ico.js` + `assets/tray.ico` + `main.js` 托盘加载接线，见功能表「托盘图标」与「图标」段），其余 13 主题不吸收。结论与理由（判据 = 上方设计原则；短哈希为主仓区间内提交）：
+
+| # | 主题 | 判定 | 理由 |
+|---|---|---|---|
+| 1 | 关闭即隐藏 + 首次关闭确认框（47459346834、5637311d5ab） | 不吸收（已对齐） | desktop 因 close 语义**从退出改为隐藏**才需要模态教导框 + 共享 shell 对话框；启动器 close→hide + 一次性托盘气泡已是更轻的「看得见的回路」，且每会话提醒优于持久化标记 |
+| 2 | 可中断退出 / 退出前任务确认（47459346834、e6f135f15cf、fbb3fb770f9） | 不吸收 | 依赖 desktop-host IPC 的活动任务查询（quit-inspection.ts）；启动器退出不中断 DSH（「退出（DSH 继续运行）」菜单语义自说明），无任务面；quitting 标志 + 停止确认 3s 既有语义已覆盖竞态 |
+| 3 | 托盘图标逐尺寸渲染（47459346834 render-tray-icon.ts、eec2b5fa6ed） | **吸收** | 托盘 16 逻辑像素 @100%–400% 显示缩放，逐尺寸原生栅格化 + Windows 按 DPI 自选位图 = 各缩放边缘清晰，优于缩小一张大位图；已落地（见功能表「托盘图标」）。官方的鲸鱼放大 1.2 倍**不适用**：那是「瓷砖底板 + 图形内缩」布局的修正，启动器是全幅白鲸 |
+| 4 | 更新重启抬升窗口（d2a5490fa0b） | 不吸收 | desktop 自更新体系专属；启动器无自更新（分发即本 git 仓库，rc.1 轮已拒绝自更新体系） |
+| 5 | 启动器代理约束（8b609392204） | 不吸收 | 实测为 macOS `start-desktop.command` / `启动Desktop.command` 启动脚本把代理设置收窄到 runtime preparation；与启动器代码面无关 |
+| 6 | flock 惰性加载 / native 按需构建（0126d5be205） | 不吸收 | flock-entry.ts + macos-notarization-proxy 是 desktop 启动性能与 macOS 构建优化；启动器薄壳无对应面 |
+| 7 | Platform 存储清理 / 身份发布（fff88f7375c） | 不吸收 | 账户生态（platform-view 存储清理 + 匿名身份发布），哲学边界 |
+| 8 | 账户 / 公告 / onboarding / 登出 / 欢迎页族（3970cc974f1、081526aa3e9、8f180cf45f6、b8df537f072、9987cae3eab 等 15 提交） | 不吸收 | desktop 产品生态；启动器不向它的生态伸手 |
+| 9 | 快捷键重构族（4fdcaf16b51、91423ea1b44、6a82709a2b6、bca9cecc7d9） | 不吸收 | keyboard.ts / keybindings.ts 是 desktop 主进程的原生菜单拦截与快捷键录制；Web 端键盘快捷键随 rc.2 的 web 构建自动继承（内嵌 webview 直接受益）；启动器无快捷键面 |
+| 10 | 蓝色焦点环 / API key 自动填充 / UI 材料统一（4f1a1289f55、11c0511271d、fdd14a09898、6000dcdda55、df2372fefed） | 不吸收 | client/web 端视觉与功能，随 rc.2 web 构建自动继承 |
+| 11 | boot 跳过包一次性报告（c8b10a16be9） | 不吸收 | packages/boot/app-boot 的 stdout 去重改进，经启动器日志透传自动受益，契约面无变化 |
+| 12 | 安装器 / 构建 / 测试加固（037bed1f41c、4e41ccadcc6、63c7e370ce7、e44a4d4dd3a、ac586cefca8、20dae9b6fa6、a67119845d4、06717aebbb7、59d2e01575f） | 不吸收 | desktop 打包与测试基建（安装器前置校验、import 记录检查与 wine gate、bundle 顺序、fixture 隔离、分支本地启动器回收） |
+| 13 | 托盘菜单重构 / 共享对话框技术（47459346834 tray.ts、5637311d5ab） | 不吸收 | 启动器托盘菜单为自有设计（重启/停止/开机自启等 DSH 生命周期项）；「无父窗口原生对话框」技术仅在有退出确认对话框时才有用武之地——记录备忘，将来若加退出对话框可回看 5637311d5ab |
+| 14 | LibreOffice Kit 0.1.1 / 翻译记录 re-key / 发布与合并提交（03bd8258c3f、e7def469e13、787b746b807、各 merge） | 不吸收 | harness 侧依赖与仓库机制已随主仓同步处理；merge 无独立内容 |
+
 - 体验官方桌面端（与启动器无关，仅备忘）：仓库根执行 `pnpm run dev:desktop`（构建后可直接 `pnpm run start:desktop`）；正式 Windows 安装包走 `pnpm run package:desktop:win:x64`（发布级需 EV 签名基础设施，`:dir` 变体产出免安装目录）
 - 若用户显式决定退役：直接删除本目录即可，DSH 本体与官方桌面端不受影响（配置与日志见「卸载」）
 
 ## 依赖的上游契约
 
-启动器只依赖下列上游契约，不读 DSH 内部 API。DSH 更新后按本表逐项核对（`核对基线：dsh 0.1.7-rc.2，HEAD 477b4f4205`；本次核对覆盖自 `0.1.7-rc.1` / `46a7f68b09` 起的 346 个提交，九条契约全部仍然成立，**契约面未变**——承载契约核心事实的文件（`apps/cli/src/args.ts` 与入口 `apps/cli/src/bin.ts`、`packages/bundle/web-app/src/startup.ts`、`packages/bundle/web-app/src/index.ts`、`packages/client/connection/src/browser-auth.ts`）在该区间内一处未动；其余承载文件的变化均不触契约事实：`cordis.patch.yml` 仅新增 schedule/shortcuts 插件行（host/port 默认值未动）、根 `package.json` 仅版本号与构建脚本（`engines.node ^22.19.0 || >=24.0.0`、`packageManager pnpm@11.7.0` 未动）、`apps/cli` 与 `web-app` 的 `package.json` 仅新增插件依赖。上一轮（0.1.5-rc.2 → 0.1.7-alpha.2，3009 个提交）需要改写的只有别名来源一条：`dsh <name>` 已成为**通用**缩写规则，`dsh web` 走的就是它；web 参数族由 web bundle 的 `startup.ts` 声明——两者都已并入下表。上轮记入的三项正面影响（Web 端内置浏览器默认关闭、源码启动的运行时模块解析修复、插件兼容性准入只约束插件包）继续成立。**2026-09-25 工作树复核**：本地工作树为 0.1.7-rc.2 之上叠 12 个本地提交（分支 `update/0.1.7-rc.2`，HEAD `88f34c74cd`，详见主仓 git log）。12 个契约文件中仅 2 个被本地补丁触碰，且都是追加式、与本启动器依赖的事实无关：`cordis.patch.yml` 新增 ui-billing 插件行（不触碰 host/port 默认值）、`index.ts` 给浏览器启动器 spawn 补 `windowsHide: true`（启动器恒带 `--no-open`，该路径不会执行）；其余 10 个未动。九条契约在当前工作树（含全部本地补丁）上逐项实测仍全部成立。
+启动器只依赖下列上游契约，不读 DSH 内部 API。DSH 更新后按本表逐项核对（`核对基线：dsh 0.1.7-rc.2，上游 HEAD 477b4f4205 + 本地工作树 HEAD 31db0f7049`；上游核对覆盖自 `0.1.7-rc.1` / `46a7f68b09` 起的 346 个提交，九条契约全部仍然成立，**契约面未变**——承载契约核心事实的文件（`apps/cli/src/args.ts` 与入口 `apps/cli/src/bin.ts`、`packages/bundle/web-app/src/startup.ts`、`packages/bundle/web-app/src/index.ts`、`packages/client/connection/src/browser-auth.ts`）在该区间内一处未动；其余承载文件的变化均不触契约事实：`cordis.patch.yml` 仅新增 schedule/shortcuts 插件行（host/port 默认值未动）、根 `package.json` 仅版本号与构建脚本（`engines.node ^22.19.0 || >=24.0.0`、`packageManager pnpm@11.7.0` 未动）、`apps/cli` 与 `web-app` 的 `package.json` 仅新增插件依赖。上一轮（0.1.5-rc.2 → 0.1.7-alpha.2，3009 个提交）需要改写的只有别名来源一条：`dsh <name>` 已成为**通用**缩写规则，`dsh web` 走的就是它；web 参数族由 web bundle 的 `startup.ts` 声明——两者都已并入下表。上轮记入的三项正面影响（Web 端内置浏览器默认关闭、源码启动的运行时模块解析修复、插件兼容性准入只约束插件包）继续成立。**2026-09-26 工作树复核（基线 `31db0f7049`）**：主仓本地分支已并回 master，HEAD 现为上游 `477b4f4205` 之上叠 14 个本地提交；自上轮复核点 `88f34c74cd` 起新增 2 提交（`0e01d4e7fc` 重生成官方目录与配对记录、`31db0f7049` clean 修复），12 个契约承载文件逐一 `git diff --stat 88f34c74cd..31db0f7049` **全部为空**。全量本地区间（`477b4f4205..31db0f7049`）内 12 个契约文件仅 3 个被本地提交触碰，且均为追加式、不触契约事实：`cordis.patch.yml` 新增 ui-billing 插件行（host/port 默认值未动）、`web-app/package.json` 为该行新增配对的 manifest 依赖、`index.ts` 给浏览器启动器 spawn 补 `windowsHide: true`（启动器恒带 `--no-open`，该路径不会执行）；其余 9 个未动。九条契约在当前工作树（含全部本地提交）上逐项实测仍全部成立——静态空 diff + 六项行为探针双证：`dsh --profile desktop` 拒绝（`error: profile "desktop" is managed exclusively by the Electron application`，退出码 1）、`dsh web --help` 参数族（`--host` / `--no-open` / `--port` / `--trusted-host` 全在）、根 `package.json` `engines.node` 读取为 `^22.19.0 || >=24.0.0`、`node --import tsx/esm apps/cli/src/bin.ts` 源码启动可解析、前端 dist 锚点从 web-app bundle 内解析成功且 `dist/index.html` 在树、`cordis.patch.yml` 默认 `host ?? '127.0.0.1'` / `port ?? 3080`；令牌行 / 就绪信号 / 探测语义三条由活体验证闭环。
 
 | 契约 | 上游位置 | 启动器如何依赖 |
 |---|---|---|
@@ -63,6 +82,7 @@
 | 现代化窗口 | Win11 圆角、无边框、系统窗口按钮（titleBarOverlay）、淡炭黑主题 |
 | 启动状态页 | 动画 + DSH 实时输出日志（滚动保留 200 行），失败可一键重试 |
 | 托盘驻留 | 关窗 = 最小化到托盘；托盘菜单：显示窗口 / 浏览器打开 / 打开 DSH 目录 / 打开配置目录 / 重启 DSH / 停止 DSH / 开机自启 / 退出 |
+| 托盘图标 | 逐尺寸渲染的多尺寸 ICO（`assets/tray.ico`，16/20/24/32/40/48/64 px 七档 PNG 条目，吸收官方 desktop 0.1.7-rc.2 的做法）：Windows 按显示缩放自挑最合适的位图，100%–400% 缩放下边缘都清晰；ico 缺失或不可用时回退单尺寸 `tray-32.png` |
 | 退出语义 | 「退出」保留 DSH 后台运行；「退出并停止 DSH」先杀服务 |
 | 单实例 | 二次启动聚焦已有窗口；`--hidden` 参数 = 托盘驻留启动（开机自启用） |
 | 断线横幅 | DSH 挂掉自动检测并提示，恢复后重连 |
@@ -102,8 +122,8 @@ DSH 输出同时写入 `%APPDATA%\dsh-launcher\dsh.log`（UTF-8 BOM，超 2MB �
 
 ## 图标
 
-- 应用/任务栏图标：官方 favicon 黑鲸鱼（透明底，`assets/icon-*.png`）。
-- 托盘图标：白色鲸鱼（Win11 深色任务栏上黑色图标不可见，故托盘用白色，与任务栏应用图标不同）。
+- 应用/任务栏图标：官方 favicon 黑鲸鱼（透明底，`assets/icon-*.png`；`icon.ico` 由 `make-icon-ico.js` 生成）。
+- 托盘图标：白色鲸鱼（Win11 深色任务栏上黑色图标不可见，故托盘用白色，与任务栏应用图标不同）。托盘用逐尺寸渲染的多尺寸 ICO `assets/tray.ico`（16/20/24/32/40/48/64 px 七档 PNG 条目，吸收官方 desktop 的做法）：每个尺寸独立从矢量原生栅格化而非缩小一张大位图，Windows 按显示缩放自挑最合适的位图，100%–400% 缩放下边缘都清晰。改 `assets/whale-white.svg` 后在仓库根执行 `node make-tray-ico.js` 再生成（sharp 借 DSH 仓库的 pnpm 安装，零新依赖）；ico 缺失或不可用时启动器自动回退单尺寸 `tray-32.png`。
 
 ## 卸载
 
