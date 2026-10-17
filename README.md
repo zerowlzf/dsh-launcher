@@ -82,7 +82,7 @@
 
 - **双击 `Start-Launcher.vbs`** 启动（首次自动安装依赖，之后秒开）。
 - 或命令行：`npx electron .`（目录内）。
-- 回归测试：`npm test` = 纯桩竞态用例（`test-race.js`）+ webview 加载竞态用例（`test-webview.js`，会拉起隐藏窗口的 Electron，约 10 秒；不启动真实 DSH）。
+- 回归测试：`npm test` = 纯桩竞态用例（`test-race.js`）+ webview 加载竞态用例（`test-webview.js`，会拉起隐藏窗口的 Electron，约 10 秒；不启动真实 DSH；`test-webview.js` 与 `Start-Launcher.vbs` 都会剥离 `ELECTRON_RUN_AS_NODE`，从 Electron 宿主的集成终端里也能直接跑）。
 
 ## 功能
 
