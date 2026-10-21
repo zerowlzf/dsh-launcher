@@ -72,6 +72,8 @@
 
 **吸收记录（0.2.1-rc.2 轮，2026-10-17）**：桌面端 0.2.1-rc.1→0.2.1-rc.2 增量仅为 `apps/desktop` 与 `apps/desktop-host` 两包 `package.json` 的版本串（各 ±1 行：实测均为 `0.2.1-rc.2`、仍 `private: true`），`src` 零改动，无主题可评、吸收项 0；契约面复核结论见下节。
 
+**补记（2026-10-18，对端复核轮）**：rc.2 复核（基线 `c99d155bdb`）之后，对端在 fork 上又推送 6 个提交——1 个 `tool-cordis` 输入再解析修复（声明 `string` 输入的方法不再被 JSON 再解析，带钉住测试）、1 个 `session-format` v1→v2 保留链测试、4 个文档重构与勘误提交；契约承载文件（`apps/cli/src/args.ts`、`apps/cli/src/bin.ts`、`packages/bundle/web-app/src/startup.ts`、`packages/bundle/web-app/src/index.ts`、`packages/client/connection/src/browser-auth.ts`）逐字节零改动，`cordis.patch.yml` 默认值行号仍为 183/184/202，下节九条契约结论全部继续成立（当前 fork tip `3ccde0b48e`，rc.2 之上 52 个本地提交）。
+
 - 体验官方桌面端（与启动器无关，仅备忘）：仓库根执行 `pnpm run dev:desktop`（构建后可直接 `pnpm run start:desktop`）；正式 Windows 安装包走 `pnpm run package:desktop:win:x64`（发布级需 EV 签名基础设施，`:dir` 变体产出免安装目录）
 - 若用户显式决定退役：直接删除本目录即可，DSH 本体与官方桌面端不受影响（配置与日志见「卸载」）
 
